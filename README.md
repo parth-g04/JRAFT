@@ -92,7 +92,7 @@ To verify the system's resilience:
 
 ---
 
-## 🔮 Future Roadmap
+##  Future Roadmap
 
 * **Log Replication:** Currently, data is persisted locally. Next step is to replicate the Write-Ahead Log across all follower nodes.
 * **Snapshotting:** Implement log compaction to manage disk usage over time.
