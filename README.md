@@ -56,7 +56,7 @@ One of the core engineering challenges was preventing "Dual Leaders." The system
 Clone the repository and compile the source code:
 ```bash
 git clone https://github.com/parth-g04/JRAFT.git
-cd j-raft/src
+cd JRAFT/src
 javac *.java
 ```
 ### Running the Cluster
