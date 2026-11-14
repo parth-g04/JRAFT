@@ -1,2 +1,4 @@
-// TCP transport extraction is planned after the core boundary is established.
-dependencies { implementation(project(":kv")) }
+dependencies {
+    implementation(project(":raft-core"))
+    implementation(project(":kv"))
+}
