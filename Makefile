@@ -1,4 +1,4 @@
-.PHONY: build test chaos bench check-history
+.PHONY: build test chaos chaos-one bench check-history
 
 build:
 	gradle build
@@ -6,14 +6,14 @@ build:
 test:
 	gradle test
 
-# Implemented by the deterministic simulator in Phase 2.
 chaos:
-	@echo "Chaos simulation is not implemented yet (Phase 2)."
-	@exit 2
+	gradle :sim:chaos -Pseed=1 -Pseeds=$(or $(SEEDS),200)
+
+chaos-one:
+	gradle :sim:chaos -Pseed=$(SEED) -Pseeds=1
 
 bench:
 	gradle :bench:run
 
 check-history:
-	@echo "History checker is not implemented yet (Phase 2)."
-	@exit 2
+	cd tools/porcupine-check && go run . $(abspath $(FILE))

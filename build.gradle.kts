@@ -19,3 +19,8 @@ subprojects {
     }
     tasks.withType<Test>().configureEach { useJUnitPlatform() }
 }
+
+tasks.named<Test>("test") {
+    dependsOn(":sim:quickChaos")
+    dependsOn(subprojects.map { "${it.path}:test" })
+}
