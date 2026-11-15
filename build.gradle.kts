@@ -10,12 +10,17 @@ allprojects {
 
 subprojects {
     apply(plugin = "java")
-    extensions.configure<JavaPluginExtension> {
-        toolchain.languageVersion.set(JavaLanguageVersion.of(21))
-    }
     tasks.withType<JavaCompile>().configureEach {
         options.encoding = "UTF-8"
+        // `release` pins the Java 21 API and bytecode while allowing any JDK >= 21
+        // to run the build (CI uses 21; local machines may have a newer JDK).
         options.release.set(21)
+    }
+    dependencies {
+        // Gradle 9 no longer puts the JUnit Platform launcher on the test classpath
+        // implicitly; without it every test task fails with "Failed to load JUnit Platform".
+        "testImplementation"(platform("org.junit:junit-bom:5.11.4"))
+        "testRuntimeOnly"("org.junit.platform:junit-platform-launcher")
     }
     tasks.withType<Test>().configureEach { useJUnitPlatform() }
 }

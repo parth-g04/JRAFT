@@ -20,6 +20,7 @@ public final class SimNetwork {
     private final PriorityQueue<Scheduled> queue = new PriorityQueue<>(
             Comparator.comparingLong(Scheduled::at).thenComparingLong(Scheduled::order));
     private final Map<Integer, Integer> partitionSide = new HashMap<>();
+    private final Set<Integer> crashed = new java.util.HashSet<>();
     private double dropProbability;
     private double duplicateProbability;
     private int maximumDelay;
@@ -49,7 +50,11 @@ public final class SimNetwork {
 
     public void heal() { partitionSide.clear(); }
 
+    public void crash(int nodeId) { crashed.add(nodeId); }
+    public void restart(int nodeId) { crashed.remove(nodeId); }
+
     public void send(long now, int from, int to, Message message) {
+        if (crashed.contains(from) || crashed.contains(to)) return;
         int fromSide = partitionSide.getOrDefault(from, 0);
         int toSide = partitionSide.getOrDefault(to, 0);
         if (fromSide != toSide || random.nextDouble() < dropProbability) return;
@@ -66,6 +71,7 @@ public final class SimNetwork {
         List<Delivery> ready = new ArrayList<>();
         while (!queue.isEmpty() && queue.peek().at() <= now) {
             Delivery delivery = queue.remove().delivery();
+            if (crashed.contains(delivery.from()) || crashed.contains(delivery.to())) continue;
             int fromSide = partitionSide.getOrDefault(delivery.from(), 0);
             int toSide = partitionSide.getOrDefault(delivery.to(), 0);
             if (fromSide == toSide) ready.add(delivery);

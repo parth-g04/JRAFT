@@ -1,7 +1,13 @@
 dependencies {
     implementation(project(":raft-core"))
+    implementation(project(":raft-storage"))
     testImplementation("org.junit.jupiter:junit-jupiter:5.11.4")
     testImplementation("org.assertj:assertj-core:3.27.3")
+}
+
+tasks.test {
+    // The Porcupine integration test needs tools/porcupine-check, which lives at the repo root.
+    systemProperty("jraft.repoRoot", rootDir.absolutePath)
 }
 
 val mainSourceSet = sourceSets.named("main")

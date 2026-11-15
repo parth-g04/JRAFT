@@ -10,4 +10,5 @@ public interface OutputHandler {
     void appendToLog(List<LogEntry> entries);
     void truncateLog(long fromIndex);
     void applyEntries(List<LogEntry> entries);
+    default void flush() { }
 }

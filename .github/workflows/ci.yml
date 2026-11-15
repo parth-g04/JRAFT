@@ -16,5 +16,21 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: '1.22'
+          cache: false
+      - name: Porcupine checker (Go unit tests)
+        working-directory: tools/porcupine-check
+        run: |
+          go mod tidy
+          go test ./...
       - uses: gradle/actions/setup-gradle@v4
-      - run: make test
+      - name: Unit tests + 50-seed quick chaos
+        run: make test
+      - name: Upload failing histories
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: histories
+          path: |
+            build/histories/
+            sim/build/histories/
+          if-no-files-found: ignore

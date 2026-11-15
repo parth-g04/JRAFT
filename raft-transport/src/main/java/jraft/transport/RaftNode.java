@@ -29,8 +29,10 @@ public final class RaftNode {
             } else if (output instanceof Output.TruncateLog truncate) {
                 outputHandler.truncateLog(truncate.fromIndex());
             } else if (output instanceof Output.ApplyEntries apply) {
+                outputHandler.flush();
                 outputHandler.applyEntries(apply.entries());
             } else if (output instanceof Output.Send send) {
+                outputHandler.flush();
                 transport.send(send.peerId(), send.message());
             }
         }

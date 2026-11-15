@@ -13,7 +13,9 @@ class PorcupineCheckerIntegrationTest {
         assumeTrue(goAvailable(), "Go 1.22 is not installed; skipping Porcupine history check");
         long seed = 9001;
         ChaosTest.runSeed(seed);
-        Path checkerDirectory = Path.of("tools", "porcupine-check").toAbsolutePath();
+        // Gradle runs tests from sim/, so resolve the checker from the repository root.
+        Path repoRoot = Path.of(System.getProperty("jraft.repoRoot", "..")).toAbsolutePath();
+        Path checkerDirectory = repoRoot.resolve("tools").resolve("porcupine-check");
         Path history = Path.of("build", "histories", seed + ".jsonl").toAbsolutePath();
         Process process = new ProcessBuilder("go", "run", ".", history.toString())
                 .directory(checkerDirectory.toFile()).redirectErrorStream(true).start();

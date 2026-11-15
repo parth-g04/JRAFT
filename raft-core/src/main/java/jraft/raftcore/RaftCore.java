@@ -38,6 +38,25 @@ public final class RaftCore {
         this.heartbeatTicks = heartbeatTicks;
     }
 
+    public RaftCore(int id, List<Integer> peers, int electionTimeoutTicks, int heartbeatTicks,
+                    long currentTerm, Integer votedFor, long commitIndex, List<LogEntry> initialLog) {
+        this(id, peers, electionTimeoutTicks, heartbeatTicks);
+        if (currentTerm < 0 || commitIndex < 0 || commitIndex > initialLog.size()) {
+            throw new IllegalArgumentException("invalid recovered hard state");
+        }
+        for (int index = 0; index < initialLog.size(); index++) {
+            LogEntry entry = initialLog.get(index);
+            if (entry.index() != index + 1L || entry.term() > currentTerm) {
+                throw new IllegalArgumentException("recovered log must be contiguous and not from a future term");
+            }
+        }
+        this.currentTerm = currentTerm;
+        this.votedFor = votedFor;
+        this.commitIndex = commitIndex;
+        this.lastApplied = commitIndex;
+        this.log.addAll(initialLog);
+    }
+
     public List<Output> tick() {
         electionElapsed++;
         leaderContactElapsed++;
@@ -97,12 +116,15 @@ public final class RaftCore {
                 && request.term() >= currentTerm + 1
                 && leaderContactElapsed >= electionTimeoutTicks
                 && candidateLogIsAtLeastAsCurrent(request.lastLogTerm(), request.lastLogIndex());
-        return List.of(new Output.Send(from, new Message.PreVoteReply(currentTerm, granted)));
+        return List.of(new Output.Send(from, new Message.PreVoteReply(currentTerm, request.term(), granted)));
     }
 
     private List<Output> onPreVoteReply(int from, Message.PreVoteReply reply) {
-        if (!preVoteRound || reply.term() != currentTerm || !reply.granted()
-                || !peers.contains(from)) return List.of();
+        if (!preVoteRound || reply.prospectiveTerm() != currentTerm + 1 || !peers.contains(from)) {
+            return List.of();
+        }
+        if (reply.term() > currentTerm) return stepDown(reply.term());
+        if (!reply.granted()) return List.of();
         preVotes.add(from);
         if (!hasMajority(preVotes.size())) return List.of();
         preVoteRound = false;
@@ -217,6 +239,7 @@ public final class RaftCore {
         long newCommit = Math.min(request.leaderCommit(), lastLogIndex());
         if (newCommit > commitIndex) {
             commitIndex = newCommit;
+            if (!termChanged) outputs.add(persistHardState());
             outputs.addAll(applyCommitted());
         }
         if (termChanged) outputs.add(0, persistHardState());

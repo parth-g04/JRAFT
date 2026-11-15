@@ -15,7 +15,7 @@ class RaftCoreTest {
 
         assertThat(preVote).contains(new Output.Send(2,
                 new Message.PreVoteRequest(1, 1, 0, 0)));
-        List<Output> election = node.step(2, new Message.PreVoteReply(0, true));
+        List<Output> election = node.step(2, new Message.PreVoteReply(0, 1, true));
         assertThat(election.getFirst()).isEqualTo(new Output.PersistHardState(1, 1, 0));
         assertThat(node.role()).isEqualTo(NodeRole.CANDIDATE);
 
@@ -45,7 +45,7 @@ class RaftCoreTest {
 
         List<Output> response = node.step(3, new Message.PreVoteRequest(5, 3, 0, 0));
 
-        assertThat(response).contains(new Output.Send(3, new Message.PreVoteReply(4, false)));
+        assertThat(response).contains(new Output.Send(3, new Message.PreVoteReply(4, 5, false)));
         assertThat(node.currentTerm()).isEqualTo(4);
     }
 
@@ -55,8 +55,10 @@ class RaftCoreTest {
         node.step(1, new Message.AppendRequest(1, 1, 0, 0,
                 List.of(new LogEntry(1, 1, new byte[]{1}), new LogEntry(2, 1, new byte[]{2})), 0));
 
-        List<Output> conflict = node.step(1, new Message.AppendRequest(2, 1, 0, 0,
-                List.of(new LogEntry(1, 2, new byte[]{9})), 0));
+        // Leader claims index 2 has term 2; follower holds term 1 there. The prefix
+        // check must fail and hint the first index of the follower's conflicting term.
+        List<Output> conflict = node.step(1, new Message.AppendRequest(2, 1, 2, 2,
+                List.of(new LogEntry(3, 2, new byte[]{9})), 0));
 
         assertThat(conflict).anyMatch(output -> output instanceof Output.Send send
                 && send.message() instanceof Message.AppendReply reply
@@ -85,7 +87,7 @@ class RaftCoreTest {
         node.tick();
         node.tick();
         node.tick();
-        node.step(2, new Message.PreVoteReply(1, true));
+        node.step(2, new Message.PreVoteReply(1, 2, true));
         node.step(2, new Message.VoteReply(2, true));
 
         node.step(2, new Message.AppendReply(2, true, 1, 0, 0));
@@ -115,8 +117,19 @@ class RaftCoreTest {
         node.tick();
         node.tick();
         node.tick();
-        node.step(2, new Message.PreVoteReply(0, true));
+        node.step(2, new Message.PreVoteReply(0, 1, true));
         node.step(2, new Message.VoteReply(1, true));
         return node;
+    }
+
+    @Test
+    void prevoteReplyFromPeerOnAnOlderTermCountsForMatchingRound() {
+        RaftCore node = new RaftCore(1, List.of(2, 3), 3, 1, 2, null, 0, List.of());
+        node.tick(); node.tick(); node.tick();
+
+        List<Output> election = node.step(2, new Message.PreVoteReply(1, 3, true));
+
+        assertThat(election.getFirst()).isEqualTo(new Output.PersistHardState(3, 1, 0));
+        assertThat(node.currentTerm()).isEqualTo(3);
     }
 }

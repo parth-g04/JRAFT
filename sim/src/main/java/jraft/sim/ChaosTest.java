@@ -35,7 +35,7 @@ public final class ChaosTest {
                 clerk.execute(KvCommand.Operation.PUT, key, value);
                 clerk.execute(KvCommand.Operation.GET, key, null);
             }
-            cluster.network().heal();
+            cluster.finishFaults();
             cluster.runTicks(30);
             List<java.util.Map<String, String>> states = new ArrayList<>();
             cluster.stateMachines().forEach(machine -> states.add(machine.snapshotView()));

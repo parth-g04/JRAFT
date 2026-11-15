@@ -7,7 +7,7 @@ public sealed interface Message permits Message.PreVoteRequest, Message.PreVoteR
     long term();
 
     record PreVoteRequest(long term, int candidateId, long lastLogIndex, long lastLogTerm) implements Message { }
-    record PreVoteReply(long term, boolean granted) implements Message { }
+    record PreVoteReply(long term, long prospectiveTerm, boolean granted) implements Message { }
     record VoteRequest(long term, int candidateId, long lastLogIndex, long lastLogTerm) implements Message { }
     record VoteReply(long term, boolean granted) implements Message { }
     record AppendRequest(long term, int leaderId, long previousIndex, long previousTerm,
