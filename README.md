@@ -1,6 +1,6 @@
 # J-Raft: Distributed Key-Value Store
 
-A distributed key-value store built from scratch in Java on the **Raft** consensus algorithm, currently being upgraded to **J-Raft v2**: a deterministic Raft core, a seed-reproducible fault-injection simulator, a durable write-ahead log, exactly-once clients and linearizable reads checked on every simulated run, and (next) snapshots, membership changes and sharding.
+A distributed key-value store built from scratch in Java on the **Raft** consensus algorithm, currently being upgraded to **J-Raft v2**: a deterministic Raft core, a seed-reproducible fault-injection simulator, a durable write-ahead log, exactly-once clients and linearizable reads checked on every simulated run, snapshots with InstallSnapshot, and (next) membership changes and sharding.
 
 Plan: [PHASES.md](PHASES.md) · Spec: [ARCHITECTURE.md](ARCHITECTURE.md) · Bugs found by simulation: [docs/BUGS.md](docs/BUGS.md) · Results: [docs/RESULTS.md](docs/RESULTS.md) · Decisions: [docs/DECISIONS.md](docs/DECISIONS.md)
 
@@ -15,8 +15,8 @@ Plan: [PHASES.md](PHASES.md) · Spec: [ARCHITECTURE.md](ARCHITECTURE.md) · Bugs
 | 2 | Deterministic simulator (`SimNetwork`, `SimClock`, `Nemesis`), history recording, Porcupine checker | Done (200 seeds) |
 | 3 | Durable storage: segmented CRC WAL, atomic hard state, crash recovery, group commit, crash/restart chaos | Done (500 seeds) |
 | 4 | Exactly-once client sessions + linearizable ReadIndex reads, linearizability checked on every seed | Done (500 seeds) |
-| 5 | Snapshots & InstallSnapshot | Next |
-| 6 | Membership changes (single-server, learners) | Planned |
+| 5 | Snapshots, WAL compaction, chunked InstallSnapshot | Done (500 seeds) |
+| 6 | Membership changes (single-server, learners) | Next |
 | 7 | Shard controller + sharded KV with live migration | Planned |
 | 8 | Real-TCP chaos, metrics dashboard, benchmarks | Planned |
 | 9 | Polish | Planned |
@@ -28,6 +28,8 @@ Plan: [PHASES.md](PHASES.md) · Spec: [ARCHITECTURE.md](ARCHITECTURE.md) · Bugs
 - Leader election with randomized timeouts and **PreVote**, so a partitioned node cannot inflate terms and depose a healthy leader.
 - Log replication with **fast backtracking** (`conflictIndex`/`conflictTerm`), a commit rule that only counts current-term entries (Raft Figure 8), and in-order apply.
 - A new leader commits a **no-op** from its own term, so it learns its commit index quickly.
+- **Snapshots and log compaction:** when the log passes a threshold, the state machine (including client sessions) is snapshotted and the log prefix is dropped. Indexes stay stable through an offset log (`lastIncludedIndex`/`lastIncludedTerm`).
+- **InstallSnapshot:** a follower that is too far behind receives the leader's snapshot in chunks, resumable after loss or restart, then continues with normal AppendEntries (bounded batches).
 - **ReadIndex** linearizable reads without writing to the log: the leader records the commit index, proves it is still leader by collecting heartbeat acks for a fresh *read round* from a majority, waits until that index is applied, then serves the read. An isolated old leader never confirms a round, so it can never return stale data.
 
 ### Exactly-once clients
@@ -38,6 +40,7 @@ Plan: [PHASES.md](PHASES.md) · Spec: [ARCHITECTURE.md](ARCHITECTURE.md) · Bugs
 - **WAL segments**: `[len][crc32][type][index][term][payload]` records, rolled at 64 MB.
 - **Recovery**: replay all segments and truncate at the first bad CRC or torn record. Tested by crashing at *every byte offset* of a write.
 - **Hard state** (`term`, `votedFor`, `commitIndex`): CRC-protected and written with write-temp → `fsync` → atomic rename.
+- **Snapshot files** (`snapshots/snap-<index>-<term>.bin`, CRC-protected, temp + fsync + rename) are made durable *before* WAL segments they cover are deleted. Recovery loads the newest valid snapshot, replays only the WAL after it, and finishes any compaction a crash interrupted. 1M-entry recovery: 1.27 s from the WAL alone, 91 ms with a snapshot.
 - **Group commit**: concurrent appends share one `force(true)` per window.
 - **Persist before send**: the driver (`RaftNode`) fsyncs before any message leaves or any entry is applied, verified by a spy test.
 - Metric: `raft_fsync_seconds` (Micrometer timer `raft.fsync`).
@@ -45,7 +48,8 @@ Plan: [PHASES.md](PHASES.md) · Spec: [ARCHITECTURE.md](ARCHITECTURE.md) · Bugs
 ### Deterministic simulation (`sim`)
 - One single-threaded scheduler drives a 3-node cluster from a **seed**, so every run is exactly reproducible.
 - `SimNetwork`: drop, delay, duplicate, reorder, partition.
-- `SimDisk`: loses unsynced writes on crash and may keep a torn prefix of unsynced appends, just like a real disk.
+- `SimDisk`: loses unsynced writes on crash and may keep a torn prefix of unsynced appends, just like a real disk. Snapshots are atomic; compaction becomes durable only at the next flush, so crashes land between the two.
+- Chaos runs with a snapshot every **8** entries and **64-byte** chunks, so nearly every seed compacts and catches a node up by InstallSnapshot.
 - `Nemesis`: random partitions (often isolating the current leader), node crash/restart, and message-duplication storms. Three concurrent clients retry against the same and different leaders.
 - Every seed's history is checked for **linearizability** in-process (`LinearizabilityChecker`) and written to `build/histories/<seed>.jsonl` for the independent Porcupine-based Go checker in `tools/porcupine-check`.
 - **Negative control:** with ReadIndex switched off (`unsafeLocalReads`), the checker flags stale reads, so passing seeds actually mean something.
@@ -62,6 +66,7 @@ make test             # unit tests + 50-seed quick chaos     (or: ./gradlew test
 make chaos SEEDS=500  # long simulation                     (or: ./gradlew :sim:chaos -Pseed=1 -Pseeds=500)
 make chaos-one SEED=81
 make bench            # group-commit window benchmark → CSV
+./gradlew :bench:recoveryBenchmark   # recovery time, 1M entries, with/without snapshot
 make check-history FILE=build/histories/123.jsonl   # Porcupine: OK / ILLEGAL (+ HTML visualization)
 ```
 

@@ -1,6 +1,7 @@
 package jraft.transport;
 
 import jraft.raftcore.LogEntry;
+import jraft.raftcore.Snapshot;
 
 import java.util.List;
 
@@ -15,4 +16,8 @@ public interface OutputHandler {
     default void readReady(long readId, long readIndex) { }
     /** A ReadIndex read cannot be served here; reply WRONG_LEADER so the client retries. */
     default void readFailed(long readId) { }
+    /** Persist a locally taken snapshot durably, then compact the WAL up to its index. */
+    void saveSnapshot(Snapshot snapshot);
+    /** Persist a snapshot received from the leader, compact the WAL, then restore the state machine. */
+    void installSnapshot(Snapshot snapshot);
 }

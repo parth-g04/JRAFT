@@ -5,6 +5,7 @@ import jraft.raftcore.Message;
 import jraft.raftcore.NodeRole;
 import jraft.raftcore.Output;
 import jraft.raftcore.RaftCore;
+import jraft.raftcore.Snapshot;
 import jraft.storage.HardState;
 import jraft.storage.Storage;
 
@@ -25,18 +26,26 @@ final class SimNode {
     /** GETs waiting for ReadIndex: readId -> request. */
     private final Map<Long, ClientRequest> pendingReads = new TreeMap<>();
     private long nextReadId;
+    private boolean executing;
 
     SimNode(int id, SimCluster cluster, List<Integer> peers, Storage storage) {
         this.id = id;
         this.cluster = cluster;
         this.storage = storage;
         try {
+            // Recovery: restore the latest snapshot, then replay committed WAL entries after it.
             HardState hardState = storage.loadHardState();
-            List<LogEntry> recovered = storage.loadLog();
+            Snapshot snapshot = storage.loadSnapshot();
+            List<LogEntry> recovered = RaftCore.entriesAfter(snapshot, storage.loadLog());
             this.core = new RaftCore(id, peers, 9 + id * 2, 2, hardState.currentTerm(),
-                    hardState.votedFor(), hardState.commitIndex(), recovered);
+                    hardState.votedFor(), hardState.commitIndex(), snapshot, recovered)
+                    .configure(cluster.maxEntriesPerAppend(), cluster.snapshotChunkBytes());
+            stateMachine.restore(snapshot.data());
             // Replaying committed entries also rebuilds the client session table.
-            for (int i = 0; i < hardState.commitIndex(); i++) stateMachine.apply(recovered.get(i));
+            for (LogEntry entry : recovered) {
+                if (entry.index() > core.commitIndex()) break;
+                stateMachine.apply(entry);
+            }
         } catch (IOException error) {
             throw new IllegalStateException("could not recover simulated node " + id, error);
         }
@@ -48,7 +57,7 @@ final class SimNode {
     RaftCore core() { return core; }
     KvStateMachine stateMachine() { return stateMachine; }
     String describe() { return id + ":" + core.role() + "/term=" + core.currentTerm()
-            + "/commit=" + core.commitIndex() + "/last=" + core.logEntries().size()
+            + "/commit=" + core.commitIndex() + "/last=" + core.lastIndex() + "/snap=" + core.snapshot().index()
             + "/disk=" + ((SimDisk) storage).describe(); }
 
     /** Entry point for client requests delivered by SimCluster. */
@@ -84,6 +93,23 @@ final class SimNode {
     }
 
     private void execute(List<Output> outputs) {
+        boolean outermost = !executing;
+        executing = true;
+        try {
+            executeOutputs(outputs);
+            if (outermost) maybeCompact();
+        } finally {
+            if (outermost) executing = false;
+        }
+    }
+
+    /** Take a snapshot once the in-memory log grows past the threshold (Raft section 7). */
+    private void maybeCompact() {
+        if (core.logSize() < cluster.snapshotThreshold() || core.lastApplied() <= core.snapshot().index()) return;
+        executeOutputs(core.compact(core.lastApplied(), stateMachine.snapshot()));
+    }
+
+    private void executeOutputs(List<Output> outputs) {
         for (Output output : outputs) {
             if (output instanceof Output.PersistHardState state) {
                 try {
@@ -119,7 +145,40 @@ final class SimNode {
             } else if (output instanceof Output.ReadFailed failed) {
                 ClientRequest request = pendingReads.remove(failed.readId());
                 if (request != null) reply(request, ClientReply.Status.WRONG_LEADER, null);
+            } else if (output instanceof Output.SaveSnapshot save) {
+                // Snapshot durable first, only then drop the WAL prefix it replaces.
+                persistSnapshot(save.snapshot());
+                cluster.countSnapshotTaken();
+            } else if (output instanceof Output.ApplySnapshot install) {
+                persistSnapshot(install.snapshot());
+                stateMachine.restore(install.snapshot().data());
+                answerWritesCoveredBy(install.snapshot().index());
+                cluster.countSnapshotInstalled();
             }
+        }
+    }
+
+    private void persistSnapshot(Snapshot snapshot) {
+        try {
+            storage.flush();                        // e.g. a TruncateLog that precedes ApplySnapshot
+            storage.saveSnapshot(snapshot);
+            storage.compactThrough(snapshot.index());
+        } catch (IOException error) {
+            throw new IllegalStateException("simulated snapshot persistence failed", error);
+        }
+    }
+
+    /** Writes this node proposed whose index is now inside an installed snapshot: answer from sessions. */
+    private void answerWritesCoveredBy(long snapshotIndex) {
+        var iterator = pendingWrites.entrySet().iterator();
+        while (iterator.hasNext()) {
+            var pending = iterator.next();
+            if (pending.getKey() > snapshotIndex) break;
+            iterator.remove();
+            ClientRequest request = pending.getValue();
+            KvStateMachine.Result result = stateMachine.cachedResult(request.clientId(), request.sequence());
+            if (result != null) reply(request, ClientReply.Status.OK, result.value());
+            else reply(request, ClientReply.Status.WRONG_LEADER, null);
         }
     }
 

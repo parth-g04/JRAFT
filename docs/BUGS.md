@@ -54,3 +54,11 @@ Record each simulation-discovered bug and its regression test here.
 - Root cause: the Phase 2/3 harness sent every GET through the Raft log, and the client took its answer from *any* replica's state machine (`SimCluster.result` scanned all nodes) instead of from the server it talked to. An old leader could never hand a stale value to a client, so the checker had nothing to catch.
 - Fix: a real client/server path (`ClientRequest`/`ClientReply` over a seeded, fault-injecting client channel that ignores partitions, so clients can reach an isolated old leader). Clients only see what the contacted server replies; every seed is checked by the in-process `LinearizabilityChecker`.
 - Regression test: negative controls that serve GETs from local state without ReadIndex and require the checker to fail: `ClientScenarioTest.withoutReadIndexTheSameScenarioReturnsStaleDataAndTheCheckerCatchesIt`, `ChaosSimulationTest.seed34WithoutReadIndexIsCaughtByTheChecker` (`Reproduce: make chaos-one SEED=34`), and `PorcupineCheckerIntegrationTest.porcupineAlsoFlagsTheStaleReadHistory` (CI).
+
+## 2026-11-15: Follower could commit entries it had not verified (latent)
+
+- Symptom: none in practice so far. Found by code review while adding bounded AppendEntries batches for Phase 5.
+- How found: writing `RaftCoreSnapshotTest.followerCommitsOnlyEntriesVerifiedByThisRequest`.
+- Root cause: on a successful AppendEntries the follower set `commitIndex = min(leaderCommit, lastLogIndex)`. Raft (Figure 2) says `min(leaderCommit, index of last new entry)`. Entries after the request's last entry were never checked against the leader's log in that request and may be a stale suffix from an old term. Committing them would apply entries the cluster never committed. It stayed hidden because the leader always sent its entire log suffix, so the two values were equal. Once a leader sends bounded batches (or a delayed short request arrives), they differ.
+- Fix: commit at most `previousIndex + entries.size()` (the last index this request verified).
+- Regression test: `RaftCoreSnapshotTest.followerCommitsOnlyEntriesVerifiedByThisRequest` (fails with the old rule: commits 3 instead of 1).

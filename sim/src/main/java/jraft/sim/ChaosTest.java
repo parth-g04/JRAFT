@@ -11,6 +11,9 @@ public final class ChaosTest {
     /** Faults run for at most this long; then the cluster is healed so remaining ops can finish. */
     private static final int FAULT_TICKS = 2_000;
     private static final int RECOVERY_TICKS = 2_000;
+    /** Tiny threshold and chunks so every seed compacts, and lagging nodes catch up by InstallSnapshot. */
+    static final int SNAPSHOT_THRESHOLD = 8;
+    static final int SNAPSHOT_CHUNK_BYTES = 64;
 
     private ChaosTest() { }
 
@@ -21,8 +24,17 @@ public final class ChaosTest {
             if (args[i].equals("--seed")) firstSeed = Long.parseLong(args[++i]);
             else if (args[i].equals("--seeds")) seeds = Integer.parseInt(args[++i]);
         }
-        for (int i = 0; i < seeds; i++) runSeed(firstSeed + i);
-        System.out.println("Chaos passed for " + seeds + " seed(s)");
+        long taken = 0;
+        long installed = 0;
+        int seedsWithInstall = 0;
+        for (int i = 0; i < seeds; i++) {
+            SimCluster cluster = runSeed(firstSeed + i, false);
+            taken += cluster.snapshotsTaken();
+            installed += cluster.snapshotsInstalled();
+            if (cluster.snapshotsInstalled() > 0) seedsWithInstall++;
+        }
+        System.out.println("Chaos passed for " + seeds + " seed(s); snapshots taken " + taken
+                + ", installed via InstallSnapshot " + installed + " (in " + seedsWithInstall + " seeds)");
     }
 
     public static void runSeed(long seed) throws Exception { runSeed(seed, false); }
@@ -31,8 +43,8 @@ public final class ChaosTest {
      * @param unsafeLocalReads test-only negative control: serve GETs from the leader's local state
      *                         without ReadIndex. The checker is expected to catch stale reads.
      */
-    public static void runSeed(long seed, boolean unsafeLocalReads) throws Exception {
-        SimCluster cluster = new SimCluster(seed);
+    public static SimCluster runSeed(long seed, boolean unsafeLocalReads) throws Exception {
+        SimCluster cluster = SimCluster.chaos(seed, SNAPSHOT_THRESHOLD, SNAPSHOT_CHUNK_BYTES);
         cluster.setUnsafeLocalReads(unsafeLocalReads);
         cluster.setHistorySeed(seed);
         List<Clerk> clerks = new ArrayList<>();
@@ -57,6 +69,7 @@ public final class ChaosTest {
                         + ": " + result.keyHistory() + "; history file " + cluster.history().path()
                         + " (make check-history FILE=" + cluster.history().path() + " for the visualization)");
             }
+            return cluster;
         } catch (RuntimeException failure) {
             throw new IllegalStateException("seed " + seed + " failed. Reproduce: make chaos-one SEED=" + seed,
                     failure);

@@ -19,6 +19,8 @@ class RaftNodePersistenceOrderTest {
             @Override public void appendToLog(List<jraft.raftcore.LogEntry> entries) { }
             @Override public void truncateLog(long fromIndex) { }
             @Override public void applyEntries(List<jraft.raftcore.LogEntry> entries) { }
+            @Override public void saveSnapshot(jraft.raftcore.Snapshot snapshot) { }
+            @Override public void installSnapshot(jraft.raftcore.Snapshot snapshot) { }
         });
         node.tick(); node.tick(); node.tick();
         events.clear();

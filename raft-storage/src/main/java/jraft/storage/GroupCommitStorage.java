@@ -1,6 +1,7 @@
 package jraft.storage;
 
 import jraft.raftcore.LogEntry;
+import jraft.raftcore.Snapshot;
 
 import java.io.IOException;
 import java.time.Duration;
@@ -34,6 +35,20 @@ public final class GroupCommitStorage implements Storage {
 
     @Override public HardState loadHardState() throws IOException { flush(); return delegate.loadHardState(); }
     @Override public List<LogEntry> loadLog() throws IOException { flush(); return delegate.loadLog(); }
+
+    @Override public Snapshot loadSnapshot() throws IOException { flush(); return delegate.loadSnapshot(); }
+
+    @Override
+    public void saveSnapshot(Snapshot snapshot) throws IOException {
+        flush();
+        delegate.saveSnapshot(snapshot);
+    }
+
+    @Override
+    public void compactThrough(long index) throws IOException {
+        flush();
+        delegate.compactThrough(index);
+    }
 
     @Override
     public void persistHardState(HardState hardState) throws IOException {

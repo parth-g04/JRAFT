@@ -1,6 +1,7 @@
 package jraft.sim;
 
 import jraft.raftcore.NodeRole;
+import jraft.raftcore.RaftCore;
 
 import java.util.ArrayList;
 import java.util.Comparator;
@@ -40,22 +41,42 @@ public final class SimCluster {
     private final PriorityQueue<ClientEnvelope> clientQueue = new PriorityQueue<>(
             Comparator.comparingLong(ClientEnvelope::at).thenComparingLong(ClientEnvelope::order));
     private final boolean faults;
+    /** Take a snapshot when this many entries sit in a node's in-memory log. */
+    private final int snapshotThreshold;
+    private final int snapshotChunkBytes;
+    /** Small batches so catch-up takes many AppendEntries rounds. */
+    private final int maxEntriesPerAppend = 8;
     private long clientOrder;
     private boolean duplicateStorm;
     private boolean unsafeLocalReads;
     private long eventTick = -1;
     private long eventCounter;
+    private long snapshotsTaken;
+    private long snapshotsInstalled;
     private HistoryRecorder historyRecorder;
     private long historySeed;
 
-    /** Chaos cluster: random network faults, client-channel faults and a nemesis. */
-    public SimCluster(long seed) { this(seed, true); }
+    /** Chaos cluster: random network faults, client-channel faults and a nemesis. Snapshots off. */
+    public SimCluster(long seed) { this(seed, true, Integer.MAX_VALUE, RaftCore.DEFAULT_SNAPSHOT_CHUNK_BYTES); }
+
+    /** Chaos cluster that snapshots every {@code snapshotThreshold} entries, sent in chunks of {@code chunkBytes}. */
+    public static SimCluster chaos(long seed, int snapshotThreshold, int chunkBytes) {
+        return new SimCluster(seed, true, snapshotThreshold, chunkBytes);
+    }
 
     /** Fault-free cluster for scripted scenarios; faults are injected by the test itself. */
-    public static SimCluster quiet(long seed) { return new SimCluster(seed, false); }
+    public static SimCluster quiet(long seed) {
+        return quiet(seed, Integer.MAX_VALUE, RaftCore.DEFAULT_SNAPSHOT_CHUNK_BYTES);
+    }
 
-    private SimCluster(long seed, boolean faults) {
+    public static SimCluster quiet(long seed, int snapshotThreshold, int chunkBytes) {
+        return new SimCluster(seed, false, snapshotThreshold, chunkBytes);
+    }
+
+    private SimCluster(long seed, boolean faults, int snapshotThreshold, int chunkBytes) {
         this.faults = faults;
+        this.snapshotThreshold = snapshotThreshold;
+        this.snapshotChunkBytes = chunkBytes;
         network = faults ? new SimNetwork(seed, 0.04, 0.01, 3) : new SimNetwork(seed, 0, 0, 1);
         nemesis = faults ? new Nemesis(seed ^ 0x5DEECE66DL) : null;
         crashRandom = new Random(seed * 31 + 7);
@@ -153,6 +174,15 @@ public final class SimCluster {
         for (int id : NODE_IDS) restartNode(id);
         network.heal();
     }
+
+    void countSnapshotTaken() { snapshotsTaken++; }
+    void countSnapshotInstalled() { snapshotsInstalled++; }
+    public long snapshotsTaken() { return snapshotsTaken; }
+    public long snapshotsInstalled() { return snapshotsInstalled; }
+    int snapshotThreshold() { return snapshotThreshold; }
+    int snapshotChunkBytes() { return snapshotChunkBytes; }
+    int maxEntriesPerAppend() { return maxEntriesPerAppend; }
+    public SimDisk disk(int id) { return disks.get(id); }
 
     /** Test-only negative control: serve GETs from local state without ReadIndex. */
     public void setUnsafeLocalReads(boolean unsafe) { unsafeLocalReads = unsafe; }

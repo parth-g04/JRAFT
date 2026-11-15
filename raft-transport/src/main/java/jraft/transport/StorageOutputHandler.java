@@ -1,6 +1,7 @@
 package jraft.transport;
 
 import jraft.raftcore.LogEntry;
+import jraft.raftcore.Snapshot;
 import jraft.storage.HardState;
 import jraft.storage.Storage;
 
@@ -12,10 +13,32 @@ import java.util.function.Consumer;
 public final class StorageOutputHandler implements OutputHandler {
     private final Storage storage;
     private final Consumer<List<LogEntry>> apply;
+    private final Consumer<byte[]> restore;
 
     public StorageOutputHandler(Storage storage, Consumer<List<LogEntry>> apply) {
+        this(storage, apply, snapshot -> { });
+    }
+
+    public StorageOutputHandler(Storage storage, Consumer<List<LogEntry>> apply, Consumer<byte[]> restore) {
         this.storage = storage;
         this.apply = apply;
+        this.restore = restore;
+    }
+
+    @Override
+    public void saveSnapshot(Snapshot snapshot) {
+        try {
+            storage.saveSnapshot(snapshot);          // durable (temp + fsync + rename) ...
+            storage.compactThrough(snapshot.index()); // ... before the WAL prefix is dropped
+        } catch (IOException error) {
+            throw new IllegalStateException("snapshot persistence failed", error);
+        }
+    }
+
+    @Override
+    public void installSnapshot(Snapshot snapshot) {
+        saveSnapshot(snapshot);
+        restore.accept(snapshot.data());
     }
 
     @Override

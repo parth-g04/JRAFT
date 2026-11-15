@@ -20,6 +20,8 @@ public final class RaftNode {
     public void receive(int from, Message message) { execute(core.step(from, message)); }
     public void propose(byte[] command) { execute(core.propose(command)); }
     public void readIndex(long readId) { execute(core.readIndex(readId)); }
+    /** Compacts the log through {@code index} using the state machine's snapshot taken at that index. */
+    public void compact(long index, byte[] stateMachineSnapshot) { execute(core.compact(index, stateMachineSnapshot)); }
 
     private void execute(Iterable<Output> outputs) {
         for (Output output : outputs) {
@@ -39,6 +41,12 @@ public final class RaftNode {
                 outputHandler.readReady(ready.readId(), ready.readIndex());
             } else if (output instanceof Output.ReadFailed failed) {
                 outputHandler.readFailed(failed.readId());
+            } else if (output instanceof Output.SaveSnapshot save) {
+                outputHandler.flush();
+                outputHandler.saveSnapshot(save.snapshot());
+            } else if (output instanceof Output.ApplySnapshot install) {
+                outputHandler.flush();
+                outputHandler.installSnapshot(install.snapshot());
             }
         }
     }
