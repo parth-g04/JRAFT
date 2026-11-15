@@ -1,6 +1,6 @@
 # J-Raft: Distributed Key-Value Store
 
-A distributed key-value store built from scratch in Java on the **Raft** consensus algorithm, currently being upgraded to **J-Raft v2**: a deterministic Raft core, a seed-reproducible fault-injection simulator, a durable write-ahead log, exactly-once clients and linearizable reads checked on every simulated run, snapshots with InstallSnapshot, and (next) membership changes and sharding.
+A distributed key-value store built from scratch in Java on the **Raft** consensus algorithm, currently being upgraded to **J-Raft v2**: a deterministic Raft core, a seed-reproducible fault-injection simulator, a durable write-ahead log, exactly-once clients and linearizable reads checked on every simulated run, snapshots with InstallSnapshot, live membership changes, and (next) sharding.
 
 Plan: [PHASES.md](PHASES.md) · Spec: [ARCHITECTURE.md](ARCHITECTURE.md) · Bugs found by simulation: [docs/BUGS.md](docs/BUGS.md) · Results: [docs/RESULTS.md](docs/RESULTS.md) · Decisions: [docs/DECISIONS.md](docs/DECISIONS.md)
 
@@ -16,8 +16,8 @@ Plan: [PHASES.md](PHASES.md) · Spec: [ARCHITECTURE.md](ARCHITECTURE.md) · Bugs
 | 3 | Durable storage: segmented CRC WAL, atomic hard state, crash recovery, group commit, crash/restart chaos | Done (500 seeds) |
 | 4 | Exactly-once client sessions + linearizable ReadIndex reads, linearizability checked on every seed | Done (500 seeds) |
 | 5 | Snapshots, WAL compaction, chunked InstallSnapshot | Done (500 seeds) |
-| 6 | Membership changes (single-server, learners) | Next |
-| 7 | Shard controller + sharded KV with live migration | Planned |
+| 6 | Membership changes: single-server, learners, leader removal | Done (500 seeds) |
+| 7 | Shard controller + sharded KV with live migration | Next |
 | 8 | Real-TCP chaos, metrics dashboard, benchmarks | Planned |
 | 9 | Polish | Planned |
 
@@ -29,6 +29,7 @@ Plan: [PHASES.md](PHASES.md) · Spec: [ARCHITECTURE.md](ARCHITECTURE.md) · Bugs
 - Log replication with **fast backtracking** (`conflictIndex`/`conflictTerm`), a commit rule that only counts current-term entries (Raft Figure 8), and in-order apply.
 - A new leader commits a **no-op** from its own term, so it learns its commit index quickly.
 - **Snapshots and log compaction:** when the log passes a threshold, the state machine (including client sessions) is snapshotted and the log prefix is dropped. Indexes stay stable through an offset log (`lastIncludedIndex`/`lastIncludedTerm`).
+- **Membership changes:** `addServer`/`removeServer`, one server at a time through configuration log entries that take effect as soon as they are appended. New servers join as non-voting **learners** and are promoted once caught up; a leader that removes itself steps down after the change commits. Quorums for commit, elections and ReadIndex always use the current voters.
 - **InstallSnapshot:** a follower that is too far behind receives the leader's snapshot in chunks, resumable after loss or restart, then continues with normal AppendEntries (bounded batches).
 - **ReadIndex** linearizable reads without writing to the log: the leader records the commit index, proves it is still leader by collecting heartbeat acks for a fresh *read round* from a majority, waits until that index is applied, then serves the read. An isolated old leader never confirms a round, so it can never return stale data.
 
@@ -49,6 +50,7 @@ Plan: [PHASES.md](PHASES.md) · Spec: [ARCHITECTURE.md](ARCHITECTURE.md) · Bugs
 - One single-threaded scheduler drives a 3-node cluster from a **seed**, so every run is exactly reproducible.
 - `SimNetwork`: drop, delay, duplicate, reorder, partition.
 - `SimDisk`: loses unsynced writes on crash and may keep a torn prefix of unsynced appends, just like a real disk. Snapshots are atomic; compaction becomes durable only at the next flush, so crashes land between the two.
+- Five server processes; the nemesis adds and removes servers (often the leader) while faults are running.
 - Chaos runs with a snapshot every **8** entries and **64-byte** chunks, so nearly every seed compacts and catches a node up by InstallSnapshot.
 - `Nemesis`: random partitions (often isolating the current leader), node crash/restart, and message-duplication storms. Three concurrent clients retry against the same and different leaders.
 - Every seed's history is checked for **linearizability** in-process (`LinearizabilityChecker`) and written to `build/histories/<seed>.jsonl` for the independent Porcupine-based Go checker in `tools/porcupine-check`.

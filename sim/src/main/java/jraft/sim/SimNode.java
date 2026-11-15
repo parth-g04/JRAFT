@@ -1,5 +1,6 @@
 package jraft.sim;
 
+import jraft.raftcore.Configuration;
 import jraft.raftcore.LogEntry;
 import jraft.raftcore.Message;
 import jraft.raftcore.NodeRole;
@@ -28,7 +29,7 @@ final class SimNode {
     private long nextReadId;
     private boolean executing;
 
-    SimNode(int id, SimCluster cluster, List<Integer> peers, Storage storage) {
+    SimNode(int id, SimCluster cluster, Configuration bootstrap, Storage storage) {
         this.id = id;
         this.cluster = cluster;
         this.storage = storage;
@@ -37,7 +38,7 @@ final class SimNode {
             HardState hardState = storage.loadHardState();
             Snapshot snapshot = storage.loadSnapshot();
             List<LogEntry> recovered = RaftCore.entriesAfter(snapshot, storage.loadLog());
-            this.core = new RaftCore(id, peers, 9 + id * 2, 2, hardState.currentTerm(),
+            this.core = new RaftCore(id, bootstrap, 9 + id * 2, 2, hardState.currentTerm(),
                     hardState.votedFor(), hardState.commitIndex(), snapshot, recovered)
                     .configure(cluster.maxEntriesPerAppend(), cluster.snapshotChunkBytes());
             stateMachine.restore(snapshot.data());
@@ -59,6 +60,19 @@ final class SimNode {
     String describe() { return id + ":" + core.role() + "/term=" + core.currentTerm()
             + "/commit=" + core.commitIndex() + "/last=" + core.lastIndex() + "/snap=" + core.snapshot().index()
             + "/disk=" + ((SimDisk) storage).describe(); }
+
+    /** Admin API (membership); only the leader accepts changes. */
+    RaftCore.ConfigChangeStatus addServer(int server) {
+        RaftCore.ConfigChangeResult result = core.addServer(server);
+        execute(result.outputs());
+        return result.status();
+    }
+
+    RaftCore.ConfigChangeStatus removeServer(int server) {
+        RaftCore.ConfigChangeResult result = core.removeServer(server);
+        execute(result.outputs());
+        return result.status();
+    }
 
     /** Entry point for client requests delivered by SimCluster. */
     void onClientRequest(ClientRequest request) {
@@ -186,7 +200,8 @@ final class SimNode {
     private void answerWrite(LogEntry entry) {
         ClientRequest request = pendingWrites.remove(entry.index());
         if (request == null) return;
-        KvCommand applied = entry.command().length == 0 ? null : KvCommandCodec.decode(entry.command());
+        KvCommand applied = entry.isConfig() || entry.command().length == 0
+                ? null : KvCommandCodec.decode(entry.command());
         if (applied == null || applied.clientId() != request.clientId() || applied.sequence() != request.sequence()) {
             // A different leader's entry won this index; our proposal was lost. The client retries.
             reply(request, ClientReply.Status.WRONG_LEADER, null);

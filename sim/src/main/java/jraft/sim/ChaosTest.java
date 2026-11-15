@@ -25,16 +25,21 @@ public final class ChaosTest {
             else if (args[i].equals("--seeds")) seeds = Integer.parseInt(args[++i]);
         }
         long taken = 0;
+        long membershipChanges = 0;
+        long leaderRemovals = 0;
         long installed = 0;
         int seedsWithInstall = 0;
         for (int i = 0; i < seeds; i++) {
             SimCluster cluster = runSeed(firstSeed + i, false);
             taken += cluster.snapshotsTaken();
+            membershipChanges += cluster.membershipChanges();
+            leaderRemovals += cluster.leaderRemovals();
             installed += cluster.snapshotsInstalled();
             if (cluster.snapshotsInstalled() > 0) seedsWithInstall++;
         }
         System.out.println("Chaos passed for " + seeds + " seed(s); snapshots taken " + taken
-                + ", installed via InstallSnapshot " + installed + " (in " + seedsWithInstall + " seeds)");
+                + ", installed via InstallSnapshot " + installed + " (in " + seedsWithInstall + " seeds)"
+                + ", membership changes " + membershipChanges + " (leader removed itself " + leaderRemovals + "x)");
     }
 
     public static void runSeed(long seed) throws Exception { runSeed(seed, false); }
@@ -57,11 +62,15 @@ public final class ChaosTest {
                 throw new IllegalStateException("clients did not finish after the cluster healed (liveness) at tick "
                         + cluster.clock().now() + " nodes=" + cluster.describeNodes());
             }
-            cluster.runTicks(40);
+            cluster.runTicks(60);
+            // Members of the final configuration must agree on the state (removed servers may lag).
+            if (cluster.configuration() == null) {
+                throw new IllegalStateException("no leader after healing: " + cluster.describeNodes());
+            }
             List<Map<String, String>> states = new ArrayList<>();
-            cluster.stateMachines().forEach(machine -> states.add(machine.snapshotView()));
-            if (states.size() != 3 || !states.get(0).equals(states.get(1)) || !states.get(1).equals(states.get(2))) {
-                throw new IllegalStateException("replicas diverged: " + states);
+            cluster.memberStateMachines().forEach(machine -> states.add(machine.snapshotView()));
+            if (states.size() < 3 || states.stream().distinct().count() != 1) {
+                throw new IllegalStateException("replicas diverged (config " + cluster.configuration() + "): " + states);
             }
             LinearizabilityChecker.Result result = LinearizabilityChecker.check(cluster.history().operations());
             if (!result.linearizable()) {

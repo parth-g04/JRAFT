@@ -22,7 +22,10 @@ public final class RaftCore {
     public static final int DEFAULT_SNAPSHOT_CHUNK_BYTES = 16 * 1024;
 
     private final int id;
-    private final List<Integer> peers;
+    /** Membership before any configuration entry or snapshot configuration exists. */
+    private final Configuration bootstrap;
+    /** CONFIG entries currently in the in-memory log: index -> configuration. */
+    private final TreeMap<Long, Configuration> configEntries = new TreeMap<>();
     private final int electionTimeoutTicks;
     private final int heartbeatTicks;
     private int maxEntriesPerAppend = DEFAULT_MAX_ENTRIES_PER_APPEND;
@@ -66,14 +69,29 @@ public final class RaftCore {
     private long receivingIndex;
     private long receivingTerm;
 
+    /** A member of a fixed initial cluster: voters = peers plus this node. */
     public RaftCore(int id, List<Integer> peers, int electionTimeoutTicks, int heartbeatTicks) {
+        this(id, initialVoters(id, peers), electionTimeoutTicks, heartbeatTicks);
+    }
+
+    /**
+     * {@code bootstrap} is the membership used until the log or a snapshot says otherwise. A node
+     * that is not a voter in it (e.g. a server about to be added) never starts elections.
+     */
+    public RaftCore(int id, Configuration bootstrap, int electionTimeoutTicks, int heartbeatTicks) {
         if (electionTimeoutTicks < 1 || heartbeatTicks < 1 || heartbeatTicks >= electionTimeoutTicks) {
             throw new IllegalArgumentException("timeouts must be positive and heartbeat shorter than election timeout");
         }
         this.id = id;
-        this.peers = peers.stream().filter(peer -> peer != id).distinct().sorted().toList();
+        this.bootstrap = bootstrap;
         this.electionTimeoutTicks = electionTimeoutTicks;
         this.heartbeatTicks = heartbeatTicks;
+    }
+
+    private static Configuration initialVoters(int id, List<Integer> peers) {
+        List<Integer> voters = new ArrayList<>(peers);
+        voters.add(id);
+        return Configuration.ofVoters(voters);
     }
 
     public RaftCore(int id, List<Integer> peers, int electionTimeoutTicks, int heartbeatTicks,
@@ -90,7 +108,14 @@ public final class RaftCore {
     public RaftCore(int id, List<Integer> peers, int electionTimeoutTicks, int heartbeatTicks,
                     long currentTerm, Integer votedFor, long commitIndex, Snapshot recoveredSnapshot,
                     List<LogEntry> initialLog) {
-        this(id, peers, electionTimeoutTicks, heartbeatTicks);
+        this(id, initialVoters(id, peers), electionTimeoutTicks, heartbeatTicks, currentTerm, votedFor,
+                commitIndex, recoveredSnapshot, initialLog);
+    }
+
+    public RaftCore(int id, Configuration bootstrap, int electionTimeoutTicks, int heartbeatTicks,
+                    long currentTerm, Integer votedFor, long commitIndex, Snapshot recoveredSnapshot,
+                    List<LogEntry> initialLog) {
+        this(id, bootstrap, electionTimeoutTicks, heartbeatTicks);
         long committed = Math.max(commitIndex, recoveredSnapshot.index());
         if (currentTerm < 0 || commitIndex < 0 || committed > recoveredSnapshot.index() + initialLog.size()
                 || recoveredSnapshot.term() > currentTerm) {
@@ -108,6 +133,7 @@ public final class RaftCore {
         this.commitIndex = committed;
         this.lastApplied = committed;
         this.log.addAll(initialLog);
+        for (LogEntry entry : initialLog) if (entry.isConfig()) configEntries.put(entry.index(), entry.configuration());
     }
 
     /** Entries of a recovered WAL that follow the snapshot. A gap after the snapshot discards the rest. */
@@ -160,10 +186,113 @@ public final class RaftCore {
             throw new IllegalArgumentException("can only compact applied entries after the current snapshot: "
                     + index + " (snapshot " + snapshot.index() + ", applied " + lastApplied + ")");
         }
-        Snapshot taken = new Snapshot(index, termAt(index), stateMachineSnapshot);
+        Snapshot taken = new Snapshot(index, termAt(index), configurationAt(index), stateMachineSnapshot);
         log.subList(0, (int) (index - snapshot.index())).clear();
+        configEntries.headMap(index, true).clear();
         snapshot = taken;
         return List.of(new Output.SaveSnapshot(taken));
+    }
+
+    // ---------------- membership changes (Raft thesis section 4.1, single-server) ----------------
+
+    public enum ConfigChangeStatus { ACCEPTED, NOT_LEADER, IN_PROGRESS, NO_CHANGE, INVALID }
+    public record ConfigChangeResult(ConfigChangeStatus status, List<Output> outputs) { }
+
+    /** Adds {@code server} as a learner. The leader promotes it to voter once it has caught up. */
+    public ConfigChangeResult addServer(int server) {
+        ConfigChangeStatus blocked = changeBlocked();
+        if (blocked != null) return new ConfigChangeResult(blocked, List.of());
+        if (configuration().isMember(server)) return new ConfigChangeResult(ConfigChangeStatus.NO_CHANGE, List.of());
+        // A re-added server starts from scratch on the leader's side.
+        matchIndex.put(server, 0L);
+        nextIndex.put(server, lastLogIndex() + 1);
+        transfers.remove(server);
+        transferOffset.remove(server);
+        return new ConfigChangeResult(ConfigChangeStatus.ACCEPTED, finish(appendConfig(configuration().withLearner(server))));
+    }
+
+    /** Removes a voter or learner. A leader that removes itself steps down once the change commits. */
+    public ConfigChangeResult removeServer(int server) {
+        ConfigChangeStatus blocked = changeBlocked();
+        if (blocked != null) return new ConfigChangeResult(blocked, List.of());
+        Configuration current = configuration();
+        if (!current.isMember(server)) return new ConfigChangeResult(ConfigChangeStatus.NO_CHANGE, List.of());
+        if (current.isVoter(server) && current.voters().size() == 1) {
+            return new ConfigChangeResult(ConfigChangeStatus.INVALID, List.of());
+        }
+        return new ConfigChangeResult(ConfigChangeStatus.ACCEPTED, finish(appendConfig(current.without(server))));
+    }
+
+    /**
+     * Single-server changes are safe only one at a time: the previous change must be committed, and
+     * the leader must have committed an entry of its own term (otherwise a change from an earlier
+     * term that it has not seen committed could still overlap with this one).
+     */
+    private ConfigChangeStatus changeBlocked() {
+        if (role != NodeRole.LEADER) return ConfigChangeStatus.NOT_LEADER;
+        if (termAt(commitIndex) != currentTerm || latestConfigIndex() > commitIndex) return ConfigChangeStatus.IN_PROGRESS;
+        return null;
+    }
+
+    /** Appends a CONFIG entry. Like every server, the leader uses it as soon as it is in its log. */
+    private List<Output> appendConfig(Configuration next) {
+        LogEntry entry = LogEntry.config(lastLogIndex() + 1, currentTerm, next);
+        log.add(entry);
+        configEntries.put(entry.index(), next);
+        matchIndex.put(id, entry.index());
+        List<Output> outputs = new ArrayList<>();
+        outputs.add(new Output.AppendToLog(List.of(entry)));
+        outputs.addAll(broadcastAppend());
+        outputs.addAll(advanceCommit());
+        return outputs;
+    }
+
+    /** Promote a learner whose log has caught up with the commit index. */
+    private List<Output> maybePromote(int server) {
+        if (!configuration().isLearner(server) || matchIndex.getOrDefault(server, 0L) < commitIndex
+                || changeBlocked() != null) {
+            return List.of();
+        }
+        return appendConfig(configuration().promote(server));
+    }
+
+    /** Leader whose removal has committed: stop leading (it is no longer a voter). */
+    private void stepDownIfRemoved() {
+        if (role == NodeRole.LEADER && !configuration().isVoter(id) && latestConfigIndex() <= commitIndex) {
+            role = NodeRole.FOLLOWER;
+            leaderId = null;
+            electionElapsed = 0;
+        }
+    }
+
+    /** Latest configuration in the log (committed or not): what this server uses. */
+    public Configuration configuration() {
+        return configEntries.isEmpty() ? snapshotConfiguration() : configEntries.lastEntry().getValue();
+    }
+
+    /** Latest configuration whose entry is committed. */
+    public Configuration committedConfiguration() { return configurationAt(commitIndex); }
+
+    private Configuration configurationAt(long index) {
+        var entry = configEntries.floorEntry(index);
+        return entry != null ? entry.getValue() : snapshotConfiguration();
+    }
+
+    private Configuration snapshotConfiguration() {
+        return snapshot.configuration() != null ? snapshot.configuration() : bootstrap;
+    }
+
+    private long latestConfigIndex() {
+        return configEntries.isEmpty() ? snapshot.index() : configEntries.lastKey();
+    }
+
+    /** Members this leader replicates to (voters and learners, without itself). */
+    private List<Integer> replicationTargets() {
+        return configuration().members().stream().filter(member -> member != id).toList();
+    }
+
+    private List<Integer> otherVoters() {
+        return configuration().voters().stream().filter(voter -> voter != id).toList();
     }
 
     private List<Output> finish(List<Output> outputs) {
@@ -184,9 +313,10 @@ public final class RaftCore {
         var iterator = pendingReads.iterator();
         while (iterator.hasNext()) {
             PendingRead read = iterator.next();
-            int confirmed = 1; // the leader itself
-            for (int peer : peers) if (ackedRound.getOrDefault(peer, 0L) >= read.readRound()) confirmed++;
-            if (hasMajority(confirmed) && lastApplied >= read.readIndex()) {
+            Set<Integer> confirmed = new HashSet<>();
+            confirmed.add(id); // the leader itself (counts only if it is a voter)
+            for (int peer : otherVoters()) if (ackedRound.getOrDefault(peer, 0L) >= read.readRound()) confirmed.add(peer);
+            if (configuration().isQuorum(confirmed) && lastApplied >= read.readIndex()) {
                 outputs.add(new Output.ReadReady(read.readId(), read.readIndex()));
                 iterator.remove();
             }
@@ -208,6 +338,7 @@ public final class RaftCore {
         if (electionElapsed < electionTimeoutTicks) return List.of();
         electionElapsed = 0;
         if (leaderContactElapsed < electionTimeoutTicks) return List.of();
+        if (!configuration().isVoter(id)) return List.of(); // learners and removed servers never campaign
         return beginPreVote();
     }
 
@@ -224,7 +355,8 @@ public final class RaftCore {
     }
 
     private List<Output> stepInternal(int from, Message message) {
-        if (!peers.contains(from)) return List.of();
+        // Any server may talk to us: a new server learns the leader before it is in our config.
+        if (from == id) return List.of();
         if (message instanceof Message.PreVoteRequest request) return onPreVoteRequest(from, request);
         if (message instanceof Message.PreVoteReply reply) return onPreVoteReply(from, reply);
         if (message instanceof Message.VoteRequest request) return onVoteRequest(from, request);
@@ -242,11 +374,11 @@ public final class RaftCore {
         preVotes.clear();
         preVotes.add(id);
         List<Output> outputs = new ArrayList<>();
-        for (int peer : peers) {
+        for (int peer : otherVoters()) {
             outputs.add(new Output.Send(peer, new Message.PreVoteRequest(currentTerm + 1, id,
                     lastLogIndex(), lastLogTerm())));
         }
-        if (hasMajority(preVotes.size())) outputs.addAll(beginElection());
+        if (configuration().isQuorum(preVotes)) outputs.addAll(beginElection());
         return List.copyOf(outputs);
     }
 
@@ -259,13 +391,13 @@ public final class RaftCore {
     }
 
     private List<Output> onPreVoteReply(int from, Message.PreVoteReply reply) {
-        if (!preVoteRound || reply.prospectiveTerm() != currentTerm + 1 || !peers.contains(from)) {
+        if (!preVoteRound || reply.prospectiveTerm() != currentTerm + 1 || !configuration().isVoter(from)) {
             return List.of();
         }
         if (reply.term() > currentTerm) return stepDown(reply.term());
         if (!reply.granted()) return List.of();
         preVotes.add(from);
-        if (!hasMajority(preVotes.size())) return List.of();
+        if (!configuration().isQuorum(preVotes)) return List.of();
         preVoteRound = false;
         return beginElection();
     }
@@ -280,11 +412,11 @@ public final class RaftCore {
         electionElapsed = 0;
         List<Output> outputs = new ArrayList<>();
         outputs.add(persistHardState());
-        for (int peer : peers) {
+        for (int peer : otherVoters()) {
             outputs.add(new Output.Send(peer, new Message.VoteRequest(currentTerm, id,
                     lastLogIndex(), lastLogTerm())));
         }
-        if (hasMajority(votes.size())) outputs.addAll(becomeLeader());
+        if (configuration().isQuorum(votes)) outputs.addAll(becomeLeader());
         return List.copyOf(outputs);
     }
 
@@ -316,8 +448,9 @@ public final class RaftCore {
     private List<Output> onVoteReply(int from, Message.VoteReply reply) {
         if (reply.term() > currentTerm) return stepDown(reply.term());
         if (role != NodeRole.CANDIDATE || reply.term() != currentTerm || !reply.granted()) return List.of();
+        if (!configuration().isVoter(from)) return List.of();
         votes.add(from);
-        return hasMajority(votes.size()) ? becomeLeader() : List.of();
+        return configuration().isQuorum(votes) ? becomeLeader() : List.of();
     }
 
     private List<Output> becomeLeader() {
@@ -329,7 +462,7 @@ public final class RaftCore {
         ackedRound.clear();
         transfers.clear();
         transferOffset.clear();
-        for (int peer : peers) {
+        for (int peer : replicationTargets()) {
             nextIndex.put(peer, lastLogIndex() + 1);
             matchIndex.put(peer, 0L);
         }
@@ -399,7 +532,7 @@ public final class RaftCore {
                 if (incoming.index() <= commitIndex) {
                     throw new IllegalStateException("leader attempted to overwrite a committed entry");
                 }
-                truncateFrom(incoming.index());
+                truncateFrom(incoming.index());   // also reverts configurations from the removed suffix
                 outputs.add(new Output.TruncateLog(incoming.index()));
                 break;
             }
@@ -408,6 +541,7 @@ public final class RaftCore {
         if (appendFrom < entries.size()) {
             List<LogEntry> suffix = entries.subList(appendFrom, entries.size());
             log.addAll(suffix);
+            for (LogEntry entry : suffix) if (entry.isConfig()) configEntries.put(entry.index(), entry.configuration());
             outputs.add(new Output.AppendToLog(suffix));
         }
         // Raft Figure 2: commitIndex = min(leaderCommit, index of last NEW entry). Entries after it
@@ -428,6 +562,7 @@ public final class RaftCore {
     private List<Output> onAppendReply(int from, Message.AppendReply reply) {
         if (reply.term() > currentTerm) return stepDown(reply.term());
         if (role != NodeRole.LEADER || reply.term() != currentTerm) return List.of();
+        if (!configuration().isMember(from)) return List.of();   // removed server: stop talking to it
         // Any reply in our term (success or log mismatch) proves the peer still accepted us as
         // leader when it handled the request that carried reply.readRound().
         ackedRound.merge(from, reply.readRound(), Math::max);
@@ -446,7 +581,14 @@ public final class RaftCore {
             nextIndex.put(from, Math.max(matchIndex.getOrDefault(from, 0L) + 1, Math.max(1, next)));
         }
         List<Output> outputs = new ArrayList<>(advanceCommit());
-        outputs.addAll(sendAppend(from));
+        if (role == NodeRole.LEADER) outputs.addAll(maybePromote(from));
+        // After a rejection always retry (backtracking). After a success, send more only if the
+        // follower still lacks entries: answering every reply with another (empty) request made each
+        // heartbeat start a ping-pong that never ended, and every duplicated message forked another.
+        boolean behind = nextIndex.getOrDefault(from, lastLogIndex() + 1) <= lastLogIndex();
+        if (role == NodeRole.LEADER && configuration().isMember(from) && (!reply.success() || behind)) {
+            outputs.addAll(sendAppend(from));
+        }
         return List.copyOf(outputs);
     }
 
@@ -480,7 +622,7 @@ public final class RaftCore {
             return List.copyOf(outputs);
         }
 
-        Snapshot received = new Snapshot(receivingIndex, receivingTerm, receiving.toByteArray());
+        Snapshot received = new Snapshot(receivingIndex, receivingTerm, request.configuration(), receiving.toByteArray());
         receiving = null;
         if (received.index() > commitIndex) outputs.addAll(installSnapshot(received));
         // else: we already have everything it covers; nothing to do.
@@ -494,10 +636,12 @@ public final class RaftCore {
         if (termAt(received.index()) == received.term()) {
             // Our log contains the snapshot's last entry: keep the entries that follow it.
             log.subList(0, (int) (received.index() - snapshot.index())).clear();
+            configEntries.headMap(received.index(), true).clear();
         } else {
             // Our log disagrees with (or is shorter than) the snapshot: discard all of it.
             if (lastLogIndex() > commitIndex) outputs.add(new Output.TruncateLog(commitIndex + 1));
             log.clear();
+            configEntries.clear();
         }
         snapshot = received;
         commitIndex = received.index();
@@ -510,6 +654,7 @@ public final class RaftCore {
     private List<Output> onInstallSnapshotReply(int from, Message.InstallSnapshotReply reply) {
         if (reply.term() > currentTerm) return stepDown(reply.term());
         if (role != NodeRole.LEADER || reply.term() != currentTerm) return List.of();
+        if (!configuration().isMember(from)) return List.of();
         ackedRound.merge(from, reply.readRound(), Math::max);
         Snapshot pinned = transfers.get(from);
         if (pinned == null || reply.lastIncludedIndex() != pinned.index()) return List.of(); // stale reply
@@ -519,7 +664,8 @@ public final class RaftCore {
             matchIndex.merge(from, pinned.index(), Math::max);
             nextIndex.put(from, Math.max(nextIndex.getOrDefault(from, 1L), pinned.index() + 1));
             List<Output> outputs = new ArrayList<>(advanceCommit());
-            outputs.addAll(sendAppend(from));
+            if (role == NodeRole.LEADER) outputs.addAll(maybePromote(from));
+            if (role == NodeRole.LEADER) outputs.addAll(sendAppend(from));
             return List.copyOf(outputs);
         }
         transferOffset.put(from, reply.nextOffset());
@@ -533,7 +679,7 @@ public final class RaftCore {
         int end = (int) Math.min(pinned.size(), offset + snapshotChunkBytes);
         byte[] chunk = Arrays.copyOfRange(pinned.data(), (int) offset, end);
         return List.of(new Output.Send(peer, new Message.InstallSnapshotRequest(currentTerm, id,
-                pinned.index(), pinned.term(), offset, chunk, end == pinned.size(), readRound)));
+                pinned.index(), pinned.term(), offset, chunk, end == pinned.size(), readRound, pinned.configuration())));
     }
 
     // ---------------- commit / apply / replication ----------------
@@ -541,13 +687,17 @@ public final class RaftCore {
     private List<Output> advanceCommit() {
         for (long candidate = lastLogIndex(); candidate > commitIndex; candidate--) {
             if (termAt(candidate) != currentTerm) continue;
-            int replicas = 1;
-            for (int peer : peers) if (matchIndex.getOrDefault(peer, 0L) >= candidate) replicas++;
-            if (hasMajority(replicas)) {
+            // Voters of the current configuration that store the entry. The leader counts only if
+            // it is still a voter (a leader removing itself does not count itself).
+            Set<Integer> replicas = new HashSet<>();
+            replicas.add(id);
+            for (int peer : otherVoters()) if (matchIndex.getOrDefault(peer, 0L) >= candidate) replicas.add(peer);
+            if (configuration().isQuorum(replicas)) {
                 commitIndex = candidate;
                 List<Output> outputs = new ArrayList<>();
                 outputs.add(persistHardState());
                 outputs.addAll(applyCommitted());
+                stepDownIfRemoved();
                 return List.copyOf(outputs);
             }
         }
@@ -563,7 +713,7 @@ public final class RaftCore {
 
     private List<Output> broadcastAppend() {
         List<Output> outputs = new ArrayList<>();
-        for (int peer : peers) outputs.addAll(sendAppend(peer));
+        for (int peer : replicationTargets()) outputs.addAll(sendAppend(peer));
         return List.copyOf(outputs);
     }
 
@@ -592,7 +742,10 @@ public final class RaftCore {
 
     private int offsetOf(long index) { return (int) (index - snapshot.index() - 1); }
     private LogEntry entryAt(long index) { return log.get(offsetOf(index)); }
-    private void truncateFrom(long index) { while (lastLogIndex() >= index) log.remove(log.size() - 1); }
+    private void truncateFrom(long index) {
+        while (lastLogIndex() >= index) log.remove(log.size() - 1);
+        configEntries.tailMap(index, true).clear();
+    }
     private Output.PersistHardState persistHardState() { return new Output.PersistHardState(currentTerm, votedFor, commitIndex); }
     private boolean candidateLogIsAtLeastAsCurrent(long term, long index) {
         return term > lastLogTerm() || (term == lastLogTerm() && index >= lastLogIndex());
@@ -609,7 +762,6 @@ public final class RaftCore {
     }
     private long lastLogIndex() { return snapshot.index() + log.size(); }
     private long lastLogTerm() { return log.isEmpty() ? snapshot.term() : log.get(log.size() - 1).term(); }
-    private boolean hasMajority(int count) { return count >= (peers.size() + 1) / 2 + 1; }
 
     public NodeRole role() { return role; }
     public long currentTerm() { return currentTerm; }

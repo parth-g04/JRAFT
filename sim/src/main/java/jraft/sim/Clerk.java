@@ -28,7 +28,7 @@ public final class Clerk implements SimCluster.Client {
         this.cluster = cluster;
         this.random = new Random(seed);
         this.operationsLeft = operations;
-        this.target = 1 + random.nextInt(SimCluster.NODE_IDS.size());
+        this.target = 1 + random.nextInt(SimCluster.ALL_NODE_IDS.size());
         cluster.register(clientId, this);
     }
 
@@ -42,7 +42,7 @@ public final class Clerk implements SimCluster.Client {
             current = nextOperation();
             // Like a client behind a load balancer or with a stale leader cache: sometimes start at a
             // random server, which may be an isolated old leader.
-            if (random.nextDouble() < 0.2) target = 1 + random.nextInt(SimCluster.NODE_IDS.size());
+            if (random.nextDouble() < 0.2) target = 1 + random.nextInt(SimCluster.ALL_NODE_IDS.size());
             callTime = cluster.eventTime();
             send(now);
         } else if (resendNow || now - sentAt >= RETRY_TIMEOUT_TICKS) {
@@ -85,5 +85,5 @@ public final class Clerk implements SimCluster.Client {
         return new ClientRequest(clientId, sequence, KvCommand.Operation.APPEND, key, value);
     }
 
-    private static int nextNode(int node) { return node % SimCluster.NODE_IDS.size() + 1; }
+    private static int nextNode(int node) { return node % SimCluster.ALL_NODE_IDS.size() + 1; }
 }

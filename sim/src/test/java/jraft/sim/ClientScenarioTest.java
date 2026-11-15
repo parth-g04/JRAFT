@@ -163,7 +163,7 @@ class ClientScenarioTest {
 
         cluster.restartNode(leader);
         cluster.runTicks(60);
-        for (KvStateMachine machine : cluster.stateMachines()) {
+        for (KvStateMachine machine : cluster.memberStateMachines()) {
             assertThat(machine.snapshotView()).containsEntry("x", "a;b;");
         }
     }

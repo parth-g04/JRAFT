@@ -22,7 +22,7 @@ class PorcupineCheckerIntegrationTest {
     @Test
     void porcupineAlsoFlagsTheStaleReadHistory() throws Exception {
         assumeTrue(goAvailable(), "Go 1.22 is not installed; skipping Porcupine history check");
-        long seed = 34;
+        long seed = 22;
         try {
             ChaosTest.runSeed(seed, true); // without ReadIndex: expected to fail the Java checker
         } catch (IllegalStateException expected) {

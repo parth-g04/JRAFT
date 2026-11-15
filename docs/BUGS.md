@@ -53,7 +53,7 @@ Record each simulation-discovered bug and its regression test here.
 - How found: designing the Phase 4 stale-leader test.
 - Root cause: the Phase 2/3 harness sent every GET through the Raft log, and the client took its answer from *any* replica's state machine (`SimCluster.result` scanned all nodes) instead of from the server it talked to. An old leader could never hand a stale value to a client, so the checker had nothing to catch.
 - Fix: a real client/server path (`ClientRequest`/`ClientReply` over a seeded, fault-injecting client channel that ignores partitions, so clients can reach an isolated old leader). Clients only see what the contacted server replies; every seed is checked by the in-process `LinearizabilityChecker`.
-- Regression test: negative controls that serve GETs from local state without ReadIndex and require the checker to fail: `ClientScenarioTest.withoutReadIndexTheSameScenarioReturnsStaleDataAndTheCheckerCatchesIt`, `ChaosSimulationTest.seed34WithoutReadIndexIsCaughtByTheChecker` (`Reproduce: make chaos-one SEED=34`), and `PorcupineCheckerIntegrationTest.porcupineAlsoFlagsTheStaleReadHistory` (CI).
+- Regression test: negative controls that serve GETs from local state without ReadIndex and require the checker to fail: `ClientScenarioTest.withoutReadIndexTheSameScenarioReturnsStaleDataAndTheCheckerCatchesIt`, `ChaosSimulationTest.seed22WithoutReadIndexIsCaughtByTheChecker` (seed 34 until the Phase 6 nemesis changed the schedule), and `PorcupineCheckerIntegrationTest.porcupineAlsoFlagsTheStaleReadHistory` (CI).
 
 ## 2026-11-15: Follower could commit entries it had not verified (latent)
 
@@ -62,3 +62,11 @@ Record each simulation-discovered bug and its regression test here.
 - Root cause: on a successful AppendEntries the follower set `commitIndex = min(leaderCommit, lastLogIndex)`. Raft (Figure 2) says `min(leaderCommit, index of last new entry)`. Entries after the request's last entry were never checked against the leader's log in that request and may be a stale suffix from an old term. Committing them would apply entries the cluster never committed. It stayed hidden because the leader always sent its entire log suffix, so the two values were equal. Once a leader sends bounded batches (or a delayed short request arrives), they differ.
 - Fix: commit at most `previousIndex + entries.size()` (the last index this request verified).
 - Regression test: `RaftCoreSnapshotTest.followerCommitsOnlyEntriesVerifiedByThisRequest` (fails with the old rule: commits 3 instead of 1).
+
+## 2026-11-15: AppendEntries ping-pong multiplied messages without bound
+
+- Symptom: after adding two more server processes and membership changes, some chaos seeds took 17-71 s instead of ~0.2 s, with a normal number of ticks. Stack samples showed all the time in `SimNetwork.drainDue`: the in-flight message queue kept growing.
+- How found: Phase 6 chaos run (100 seeds did not finish in 10 minutes); profiled seed 21.
+- Root cause: the leader answered *every* AppendReply with another AppendEntries, even when the follower was fully caught up. Each heartbeat therefore started a request/reply chain that never ended, the number of chains grew with every heartbeat, and each duplicated message (duplication storms) forked yet another permanent chain. It existed since Phase 1. It was hidden by the shorter runs and smaller clusters of earlier phases, but already cost time: 500 seeds took 3.5 min in Phase 5.
+- Fix: after a successful reply, send more only if the follower's nextIndex is still within the leader's log; after a rejection, always retry (backtracking). Heartbeats and ReadIndex rounds still go out on their own schedule.
+- Regression test: whole chaos suite; 500 seeds now run in 50 s with more nodes and more work (no seed over a few hundred ms).

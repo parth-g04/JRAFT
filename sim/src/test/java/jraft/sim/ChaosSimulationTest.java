@@ -16,15 +16,15 @@ class ChaosSimulationTest {
     }
 
     @Test
-    void seed34IsLinearizableWithReadIndex() throws Exception {
-        ChaosTest.runSeed(34);
+    void seed22IsLinearizableWithReadIndex() throws Exception {
+        ChaosTest.runSeed(22);
     }
 
     @Test
-    void seed34WithoutReadIndexIsCaughtByTheChecker() {
+    void seed22WithoutReadIndexIsCaughtByTheChecker() {
         // Negative control: the same seed with reads served from local state must be flagged.
-        assertThatThrownBy(() -> ChaosTest.runSeed(34, true))
-                .hasMessageContaining("Reproduce: make chaos-one SEED=34")
+        assertThatThrownBy(() -> ChaosTest.runSeed(22, true))
+                .hasMessageContaining("Reproduce: make chaos-one SEED=22")
                 .rootCause().hasMessageContaining("NOT linearizable");
     }
 }

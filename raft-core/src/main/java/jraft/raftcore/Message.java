@@ -2,6 +2,7 @@ package jraft.raftcore;
 
 import java.util.Arrays;
 import java.util.List;
+import java.util.Objects;
 
 public sealed interface Message permits Message.PreVoteRequest, Message.PreVoteReply,
         Message.VoteRequest, Message.VoteReply, Message.AppendRequest, Message.AppendReply,
@@ -36,19 +37,26 @@ public sealed interface Message permits Message.PreVoteRequest, Message.PreVoteR
 
     /**
      * One chunk of the leader's snapshot (ARCHITECTURE.md section 3). Chunks are sent in order;
-     * {@code done} marks the last one.
+     * {@code done} marks the last one. {@code configuration} is the membership as of
+     * lastIncludedIndex (null if none), carried with every chunk.
      */
     record InstallSnapshotRequest(long term, int leaderId, long lastIncludedIndex, long lastIncludedTerm,
-                                  long offset, byte[] data, boolean done, long readRound) implements Message {
+                                  long offset, byte[] data, boolean done, long readRound,
+                                  Configuration configuration) implements Message {
         public InstallSnapshotRequest { data = Arrays.copyOf(data, data.length); }
         @Override public byte[] data() { return Arrays.copyOf(data, data.length); }
+
+        public InstallSnapshotRequest(long term, int leaderId, long lastIncludedIndex, long lastIncludedTerm,
+                                      long offset, byte[] data, boolean done, long readRound) {
+            this(term, leaderId, lastIncludedIndex, lastIncludedTerm, offset, data, done, readRound, null);
+        }
 
         @Override
         public boolean equals(Object other) {
             return other instanceof InstallSnapshotRequest that && term == that.term && leaderId == that.leaderId
                     && lastIncludedIndex == that.lastIncludedIndex && lastIncludedTerm == that.lastIncludedTerm
                     && offset == that.offset && done == that.done && readRound == that.readRound
-                    && Arrays.equals(data, that.data);
+                    && Objects.equals(configuration, that.configuration) && Arrays.equals(data, that.data);
         }
 
         @Override public int hashCode() { return Long.hashCode(lastIncludedIndex * 31 + offset) + Arrays.hashCode(data); }

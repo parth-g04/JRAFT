@@ -77,3 +77,19 @@
 - Status: accepted for Phase 5
 - Decision: the leader sends at most `maxEntriesPerAppend` entries per AppendEntries (64 by default, 8 in the simulator). `matchIndex`/`nextIndex` only move forward on success replies.
 - Reason: a follower that is 10,000 entries behind should not receive one giant message. This also required the follower commit-rule fix in BUGS.md.
+
+## Membership: single-server changes, configuration effective when appended
+
+- Date: 2026-11-15
+- Status: accepted for Phase 6
+- Decision: membership is a `Configuration{voters, learners}` stored in `CONFIG` log entries (WAL record type 2). Every server uses the **latest configuration in its log**, committed or not, from the moment the entry is appended; truncating the entry reverts to the previous one. Only one change at a time, and only once the leader has committed an entry of its own term (Raft thesis section 4.1 and Ongaro's 2015 correction to single-server changes). Snapshots record the configuration as of their index (snapshot file format v2, v1 still readable), and InstallSnapshot carries it.
+- Reason: adding or removing one voter at a time guarantees that any majority of the old voter set overlaps any majority of the new one, so two leaders cannot be elected for the same term without joint consensus.
+- Consequence: commit, election and ReadIndex quorums are computed over the current configuration's voters. A leader that removes itself keeps replicating without counting itself and steps down when the change commits.
+
+## Learners and automatic promotion
+
+- Date: 2026-11-15
+- Status: accepted for Phase 6
+- Decision: `addServer` adds a non-voting learner. The leader replicates to it (entries or snapshot) but never counts it for quorums, and promotes it to voter with a second single-server change once its matchIndex reaches the commit index. Servers that are not voters (learners, new or removed servers) never start elections; any server accepts AppendEntries from a leader even if it is not yet in its own configuration.
+- Reason: adding an empty voter directly would immediately raise the quorum size while that server cannot acknowledge anything, which can stall commits (thesis section 4.2.1).
+- Consequence: an add is two log entries (learner, then promotion). Admin API: `addServer(id)` / `removeServer(id)` returning ACCEPTED, NOT_LEADER, IN_PROGRESS, NO_CHANGE or INVALID (removing the last voter).

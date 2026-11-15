@@ -139,6 +139,36 @@ class FileStorageSnapshotTest {
         }
     }
 
+    @Test
+    void configurationEntriesAndSnapshotConfigurationSurviveReopen() throws Exception {
+        jraft.raftcore.Configuration configuration =
+                new jraft.raftcore.Configuration(List.of(1, 2, 3), List.of(4));
+        try (FileStorage storage = new FileStorage(directory, SEGMENT_BYTES)) {
+            storage.append(List.of(new LogEntry(1, 1, new byte[0]), LogEntry.config(2, 1, configuration)));
+            storage.saveSnapshot(new Snapshot(1, 1, configuration, "s".getBytes()));
+            storage.flush();
+        }
+        try (FileStorage reopened = new FileStorage(directory, SEGMENT_BYTES)) {
+            assertThat(reopened.loadLog()).containsExactly(LogEntry.config(2, 1, configuration));
+            assertThat(reopened.loadLog().getFirst().configuration()).isEqualTo(configuration);
+            assertThat(reopened.loadSnapshot().configuration()).isEqualTo(configuration);
+        }
+    }
+
+    @Test
+    void readsVersion1SnapshotsWithoutAConfiguration() {
+        // Phase 5 format: [magic][version=1][index][term][length][data][crc]
+        byte[] data = "old".getBytes();
+        java.nio.ByteBuffer buffer = java.nio.ByteBuffer.allocate(4 + 1 + 8 + 8 + 4 + data.length + 4);
+        buffer.putInt(0x4A534E50).put((byte) 1).putLong(7).putLong(2).putInt(data.length).put(data);
+        java.util.zip.CRC32 crc = new java.util.zip.CRC32();
+        crc.update(buffer.array(), 0, buffer.position());
+        buffer.putInt((int) crc.getValue());
+
+        Snapshot snapshot = SnapshotFile.tryRead(buffer.array());
+        assertThat(snapshot).isEqualTo(new Snapshot(7, 2, null, data));
+    }
+
     // ---------------- helpers ----------------
 
     private static Snapshot snapshot(long index) {

@@ -1,8 +1,10 @@
 package jraft.storage;
 
+import jraft.raftcore.Configuration;
 import jraft.raftcore.Snapshot;
 
 import java.io.IOException;
+import java.nio.BufferUnderflowException;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.file.AtomicMoveNotSupportedException;
@@ -15,15 +17,19 @@ import java.util.List;
 import java.util.zip.CRC32;
 
 /**
- * snapshots/snap-&lt;lastIndex&gt;-&lt;lastTerm&gt;.bin = [magic:4][version:1][index:8][term:8][length:4][data][crc32:4]
- * (ARCHITECTURE.md section 2). Written to a .tmp file, forced, then atomically renamed, so a crash
- * leaves either the old snapshot or the complete new one. Older snapshots are deleted only after
- * the new one is durable. Loading picks the newest file whose CRC is valid.
+ * snapshots/snap-&lt;lastIndex&gt;-&lt;lastTerm&gt;.bin (ARCHITECTURE.md section 2):
+ * <pre>
+ * v2: [magic:4][version=2:1][index:8][term:8][configLength:4][config][dataLength:4][data][crc32:4]
+ * v1: [magic:4][version=1:1][index:8][term:8][dataLength:4][data][crc32:4]   (read only; no config)
+ * </pre>
+ * configLength = -1 means "no configuration recorded". Written to a .tmp file, forced, then
+ * atomically renamed, so a crash leaves either the old snapshot or the complete new one. Older
+ * snapshots are deleted only after the new one is durable. Loading picks the newest valid file.
  */
 final class SnapshotFile {
     private static final int MAGIC = 0x4A534E50; // JSNP
-    private static final byte VERSION = 1;
-    private static final int HEADER_BYTES = Integer.BYTES + 1 + Long.BYTES + Long.BYTES + Integer.BYTES;
+    private static final byte VERSION_1 = 1;
+    private static final byte VERSION_2 = 2;
 
     private final Path directory;
 
@@ -33,8 +39,13 @@ final class SnapshotFile {
     long write(Snapshot snapshot) throws IOException {
         Files.createDirectories(directory);
         byte[] data = snapshot.data();
-        ByteBuffer buffer = ByteBuffer.allocate(HEADER_BYTES + data.length + Integer.BYTES);
-        buffer.putInt(MAGIC).put(VERSION).putLong(snapshot.index()).putLong(snapshot.term()).putInt(data.length).put(data);
+        byte[] config = snapshot.configuration() == null ? null : snapshot.configuration().encode();
+        int configBytes = config == null ? 0 : config.length;
+        ByteBuffer buffer = ByteBuffer.allocate(4 + 1 + 8 + 8 + 4 + configBytes + 4 + data.length + 4);
+        buffer.putInt(MAGIC).put(VERSION_2).putLong(snapshot.index()).putLong(snapshot.term());
+        buffer.putInt(config == null ? -1 : config.length);
+        if (config != null) buffer.put(config);
+        buffer.putInt(data.length).put(data);
         CRC32 crc = new CRC32();
         crc.update(buffer.array(), 0, buffer.position());
         buffer.putInt((int) crc.getValue()).flip();
@@ -64,28 +75,45 @@ final class SnapshotFile {
         if (!Files.isDirectory(directory)) return Snapshot.EMPTY;
         List<Path> files = snapshotFiles();
         for (int i = files.size() - 1; i >= 0; i--) {
-            Snapshot snapshot = tryRead(files.get(i));
+            Snapshot snapshot = tryRead(Files.readAllBytes(files.get(i)));
             if (snapshot != null) return snapshot;
         }
         return Snapshot.EMPTY;
     }
 
-    private static Snapshot tryRead(Path file) throws IOException {
-        byte[] bytes = Files.readAllBytes(file);
-        if (bytes.length < HEADER_BYTES + Integer.BYTES) return null;
-        ByteBuffer buffer = ByteBuffer.wrap(bytes);
-        if (buffer.getInt() != MAGIC || buffer.get() != VERSION) return null;
-        long index = buffer.getLong();
-        long term = buffer.getLong();
-        int length = buffer.getInt();
-        if (length < 0 || length != bytes.length - HEADER_BYTES - Integer.BYTES) return null;
-        CRC32 crc = new CRC32();
-        crc.update(bytes, 0, HEADER_BYTES + length);
-        buffer.position(HEADER_BYTES + length);
-        if ((int) crc.getValue() != buffer.getInt()) return null;
-        byte[] data = new byte[length];
-        System.arraycopy(bytes, HEADER_BYTES, data, 0, length);
-        return new Snapshot(index, term, data);
+    /** Parses one snapshot file; null if it is truncated, corrupt or of an unknown version. */
+    static Snapshot tryRead(byte[] bytes) {
+        try {
+            if (bytes.length < Integer.BYTES) return null;
+            CRC32 crc = new CRC32();
+            crc.update(bytes, 0, bytes.length - Integer.BYTES);
+            if ((int) crc.getValue() != ByteBuffer.wrap(bytes, bytes.length - Integer.BYTES, Integer.BYTES).getInt()) {
+                return null;
+            }
+            ByteBuffer buffer = ByteBuffer.wrap(bytes, 0, bytes.length - Integer.BYTES);
+            if (buffer.getInt() != MAGIC) return null;
+            byte version = buffer.get();
+            long index = buffer.getLong();
+            long term = buffer.getLong();
+            Configuration configuration = null;
+            if (version == VERSION_2) {
+                int configLength = buffer.getInt();
+                if (configLength >= 0) {
+                    byte[] config = new byte[configLength];
+                    buffer.get(config);
+                    configuration = Configuration.decode(config);
+                }
+            } else if (version != VERSION_1) {
+                return null;
+            }
+            int length = buffer.getInt();
+            if (length != buffer.remaining()) return null;
+            byte[] data = new byte[length];
+            buffer.get(data);
+            return new Snapshot(index, term, configuration, data);
+        } catch (BufferUnderflowException | IllegalArgumentException | NegativeArraySizeException corrupt) {
+            return null;
+        }
     }
 
     /** Complete snapshot files (no .tmp), oldest first. Zero-padded names sort by index. */

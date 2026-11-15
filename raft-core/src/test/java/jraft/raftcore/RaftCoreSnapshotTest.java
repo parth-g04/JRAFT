@@ -9,6 +9,7 @@ import org.junit.jupiter.api.Test;
 
 class RaftCoreSnapshotTest {
     private static final byte[] STATE = "state-machine-bytes-0123456789".getBytes();
+    private static final Configuration VOTERS_123 = Configuration.ofVoters(List.of(1, 2, 3));
 
     /** Leader 1 with entries 1..n committed (no-op at 1) and acknowledged by peer 2. */
     private static RaftCore leaderWithCommitted(int commands) {
@@ -26,7 +27,8 @@ class RaftCoreSnapshotTest {
         RaftCore node = leaderWithCommitted(9);           // log 1..10
         List<Output> outputs = node.compact(6, STATE);
 
-        assertThat(outputs).containsExactly(new Output.SaveSnapshot(new Snapshot(6, 1, STATE)));
+        // The snapshot records the membership as of its index.
+        assertThat(outputs).containsExactly(new Output.SaveSnapshot(new Snapshot(6, 1, VOTERS_123, STATE)));
         assertThat(node.snapshot().index()).isEqualTo(6);
         assertThat(node.logSize()).isEqualTo(4);
         assertThat(node.lastIndex()).isEqualTo(10);
@@ -70,7 +72,8 @@ class RaftCoreSnapshotTest {
             }
             toFollower = onlyMessage(leaderOutputs, Message.InstallSnapshotRequest.class);
         }
-        assertThat(installed).contains(new Output.ApplySnapshot(new Snapshot(8, 1, STATE)));
+        assertThat(installed).contains(new Output.ApplySnapshot(new Snapshot(8, 1, VOTERS_123, STATE)));
+        assertThat(follower.configuration()).isEqualTo(VOTERS_123);
         assertThat(follower.snapshot().index()).isEqualTo(8);
         assertThat(follower.commitIndex()).isEqualTo(8);
         assertThat(follower.lastApplied()).isEqualTo(8);

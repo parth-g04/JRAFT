@@ -1,5 +1,6 @@
 package jraft.sim;
 
+import jraft.raftcore.Configuration;
 import jraft.raftcore.NodeRole;
 import jraft.raftcore.RaftCore;
 
@@ -24,7 +25,11 @@ public final class SimCluster {
 
     private record ClientEnvelope(long at, long order, int nodeId, ClientRequest request, ClientReply reply) { }
 
+    /** Initial voters. */
     public static final List<Integer> NODE_IDS = List.of(1, 2, 3);
+    /** Every server process; 4 and 5 start outside the cluster and can be added (Phase 6). */
+    public static final List<Integer> ALL_NODE_IDS = List.of(1, 2, 3, 4, 5);
+    private static final Configuration BOOTSTRAP = Configuration.ofVoters(NODE_IDS);
     private static final double CLIENT_DROP = 0.05;
     private static final double CLIENT_DUPLICATE = 0.05;
     private static final double STORM_DUPLICATE = 0.3;
@@ -52,6 +57,8 @@ public final class SimCluster {
     private long eventTick = -1;
     private long eventCounter;
     private long snapshotsTaken;
+    private long membershipChanges;
+    private long leaderRemovals;
     private long snapshotsInstalled;
     private HistoryRecorder historyRecorder;
     private long historySeed;
@@ -82,10 +89,10 @@ public final class SimCluster {
         crashRandom = new Random(seed * 31 + 7);
         clientRandom = new Random(seed * 17 + 3);
         historySeed = seed;
-        for (int id : NODE_IDS) {
+        for (int id : ALL_NODE_IDS) {
             SimDisk disk = new SimDisk();
             disks.put(id, disk);
-            nodes.put(id, new SimNode(id, this, NODE_IDS, disk));
+            nodes.put(id, new SimNode(id, this, BOOTSTRAP, disk));
         }
     }
 
@@ -146,6 +153,38 @@ public final class SimCluster {
         return clock.now() * 1000 + ++eventCounter;
     }
 
+    // ---------------- admin API (membership) ----------------
+
+    /** Asks the current leader to add {@code server} (as a learner; promoted when caught up). */
+    public RaftCore.ConfigChangeStatus addServer(int server) {
+        SimNode leader = leader();
+        if (leader == null) return RaftCore.ConfigChangeStatus.NOT_LEADER;
+        RaftCore.ConfigChangeStatus status = leader.addServer(server);
+        if (status == RaftCore.ConfigChangeStatus.ACCEPTED) membershipChanges++;
+        return status;
+    }
+
+    public RaftCore.ConfigChangeStatus removeServer(int server) {
+        SimNode leader = leader();
+        if (leader == null) return RaftCore.ConfigChangeStatus.NOT_LEADER;
+        RaftCore.ConfigChangeStatus status = leader.removeServer(server);
+        if (status == RaftCore.ConfigChangeStatus.ACCEPTED) {
+            membershipChanges++;
+            if (server == leader.core().id()) leaderRemovals++;
+        }
+        return status;
+    }
+
+    /** The leader's current configuration, or null without a leader. */
+    public Configuration configuration() {
+        SimNode leader = leader();
+        return leader == null ? null : leader.core().configuration();
+    }
+
+    /** Accepted addServer/removeServer requests (automatic learner promotions not included). */
+    public long membershipChanges() { return membershipChanges; }
+    public long leaderRemovals() { return leaderRemovals; }
+
     // ---------------- faults ----------------
 
     void setDuplicateStorm(boolean on) {
@@ -163,7 +202,7 @@ public final class SimCluster {
     public void restartNode(int id) {
         if (nodes.containsKey(id)) return;
         network.restart(id);
-        nodes.put(id, new SimNode(id, this, NODE_IDS, disks.get(id)));
+        nodes.put(id, new SimNode(id, this, BOOTSTRAP, disks.get(id)));
     }
 
     public void healNetwork() { if (nemesis != null) nemesis.heal(network); else network.heal(); }
@@ -171,7 +210,7 @@ public final class SimCluster {
     public void finishFaults() {
         if (nemesis != null) nemesis.finish(this);
         if (duplicateStorm) setDuplicateStorm(false);
-        for (int id : NODE_IDS) restartNode(id);
+        for (int id : ALL_NODE_IDS) restartNode(id);
         network.heal();
     }
 
@@ -219,6 +258,18 @@ public final class SimCluster {
     public SimNetwork network() { return network; }
     SimNode node(int id) { return nodes.get(id); }
     public String describeNodes() { return nodes.values().stream().map(SimNode::describe).toList().toString(); }
+
+    /** State machines of the members (voters and learners) of the leader's configuration. */
+    public List<KvStateMachine> memberStateMachines() {
+        Configuration configuration = configuration();
+        List<KvStateMachine> machines = new ArrayList<>();
+        if (configuration == null) return machines;
+        for (int member : configuration.members()) {
+            SimNode node = nodes.get(member);
+            if (node != null) machines.add(node.stateMachine());
+        }
+        return machines;
+    }
 
     public List<KvStateMachine> stateMachines() {
         List<KvStateMachine> machines = new ArrayList<>();

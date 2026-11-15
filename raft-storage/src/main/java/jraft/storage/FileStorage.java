@@ -37,6 +37,9 @@ public final class FileStorage implements Storage {
     private static final int MAX_RECORD_BYTES = 64 * 1024 * 1024;
     private static final int RECORD_HEADER_BYTES = Integer.BYTES * 2;
     private static final int PAYLOAD_FIXED_BYTES = 1 + Long.BYTES + Long.BYTES + Integer.BYTES;
+    /** Record type byte: 1 = state-machine command (Phase 3 format), 2 = membership configuration. */
+    private static final byte TYPE_NORMAL = 1;
+    private static final byte TYPE_CONFIG = 2;
 
     /** One WAL file; {@code firstIndex} comes from its name. */
     private record Segment(long firstIndex, Path path) { }
@@ -298,7 +301,7 @@ public final class FileStorage implements Storage {
     private static byte[] encodeRecord(LogEntry entry) {
         byte[] command = entry.command();
         ByteBuffer payload = ByteBuffer.allocate(PAYLOAD_FIXED_BYTES + command.length);
-        payload.put((byte) 1).putLong(entry.index()).putLong(entry.term()).putInt(command.length).put(command);
+        payload.put(entry.isConfig() ? TYPE_CONFIG : TYPE_NORMAL).putLong(entry.index()).putLong(entry.term()).putInt(command.length).put(command);
         CRC32 crc = new CRC32();
         crc.update(payload.array());
         ByteBuffer record = ByteBuffer.allocate(RECORD_HEADER_BYTES + payload.capacity());
@@ -326,13 +329,14 @@ public final class FileStorage implements Storage {
             long index = buffer.getLong();
             long term = buffer.getLong();
             int commandLength = buffer.getInt();
-            if (type != 1 || index < 1 || term < 0 || commandLength != length - PAYLOAD_FIXED_BYTES) {
+            if ((type != TYPE_NORMAL && type != TYPE_CONFIG) || index < 1 || term < 0
+                    || commandLength != length - PAYLOAD_FIXED_BYTES) {
                 buffer.position(start);
                 break;
             }
             byte[] command = new byte[commandLength];
             buffer.get(command);
-            parsed.add(new LogEntry(index, term, command));
+            parsed.add(new LogEntry(index, term, command, type == TYPE_CONFIG ? LogEntry.Type.CONFIG : LogEntry.Type.NORMAL));
             offsets.add((long) start);
         }
         return new Parsed(parsed, offsets, buffer.position());

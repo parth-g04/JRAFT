@@ -36,7 +36,7 @@ public final class KvStateMachine implements StateMachine {
 
     @Override
     public void apply(LogEntry entry) {
-        if (entry.command().length == 0) return; // leader no-op
+        if (entry.isConfig() || entry.command().length == 0) return; // membership entry or leader no-op
         KvCommand command = KvCommandCodec.decode(entry.command());
         Session session = sessions.get(command.clientId());
         if (session != null && command.sequence() <= session.lastSequence()) return; // duplicate

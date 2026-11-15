@@ -69,3 +69,14 @@ Reading: a window cuts the number of fsyncs by about 40%, but on this machine an
 Reading: recovery time follows the number of replayed entries; with a snapshot it is about 14x faster and no longer grows with history. The WAL still holds 24.7 MB after compaction because segments are 64 MB and only deleted once every record in them is covered; the newest segment straddles the snapshot point. The OS page cache was warm (data had just been written), so cold-disk numbers would be higher for both modes. Single machine, not a general performance claim.
 
 - Also in this phase: `FileStorage` keeps the active segment's channel open and parses segments from one buffered read instead of opening the file per append and reading fields with `RandomAccessFile.readInt`; writing 1M entries takes about 1.4 s. `SimDisk.flush` copies only the new tail instead of the whole log (it was O(n^2) and made the 10k-entry test take 214 s; now ~19 s for the whole snapshot test class).
+
+## Phase 6: membership changes
+
+- Date: 2026-11-15
+- Chaos: the Phase 5 workload (snapshots every 8 entries, 64-byte chunks) with five server processes. Nodes 1-3 start as voters, 4-5 outside the cluster. The nemesis now also changes membership: it adds a non-member (as a learner, promoted when caught up) or removes a random voter (often the leader) while keeping at least three voters. Crashes and partitions target current members; removed servers keep running.
+- Checks per seed: linearizable history, every client operation completes after healing, and all members of the final configuration have identical state.
+- Result: all 500 seeds passed (the spec asks for 300): `Chaos passed for 500 seed(s); snapshots taken 27422, installed via InstallSnapshot 4142 (in 500 seeds), membership changes 4164 (leader removed itself 453x)`, in 50 s.
+- Negative control: with ReadIndex disabled, 16 of seeds 1-200 still fail the linearizability check (first: seed 22, now the regression seed).
+- Scripted: grow 3 to 5 voters and remove two original servers (the leader first) under client load, still linearizable; a removed leader hands over and the group keeps committing; a learner that is 200 entries behind catches up by InstallSnapshot before promotion.
+- Performance: fixing the AppendEntries ping-pong (BUGS.md) cut the 500-seed run from 3 min 27 s (Phase 5, 3 nodes) to 50 s (5 nodes, membership changes).
+- Reproduce: `make chaos SEEDS=500`; `make chaos-one SEED=<n>`.
