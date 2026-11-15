@@ -11,4 +11,8 @@ public interface OutputHandler {
     void truncateLog(long fromIndex);
     void applyEntries(List<LogEntry> entries);
     default void flush() { }
+    /** A ReadIndex read is safe to serve from the (already applied) state machine. */
+    default void readReady(long readId, long readIndex) { }
+    /** A ReadIndex read cannot be served here; reply WRONG_LEADER so the client retries. */
+    default void readFailed(long readId) { }
 }

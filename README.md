@@ -1,6 +1,6 @@
 # J-Raft: Distributed Key-Value Store
 
-A distributed key-value store built from scratch in Java on the **Raft** consensus algorithm, currently being upgraded to **J-Raft v2**: a deterministic Raft core, a seed-reproducible fault-injection simulator, a durable write-ahead log, and (next) exactly-once clients, snapshots, membership changes and sharding.
+A distributed key-value store built from scratch in Java on the **Raft** consensus algorithm, currently being upgraded to **J-Raft v2**: a deterministic Raft core, a seed-reproducible fault-injection simulator, a durable write-ahead log, exactly-once clients and linearizable reads checked on every simulated run, and (next) snapshots, membership changes and sharding.
 
 Plan: [PHASES.md](PHASES.md) · Spec: [ARCHITECTURE.md](ARCHITECTURE.md) · Bugs found by simulation: [docs/BUGS.md](docs/BUGS.md) · Results: [docs/RESULTS.md](docs/RESULTS.md) · Decisions: [docs/DECISIONS.md](docs/DECISIONS.md)
 
@@ -14,8 +14,8 @@ Plan: [PHASES.md](PHASES.md) · Spec: [ARCHITECTURE.md](ARCHITECTURE.md) · Bugs
 | 1 | `RaftCore` as a pure state machine (`step`/`tick`/`propose` → `Output`s), PreVote, fast log backtracking | Done |
 | 2 | Deterministic simulator (`SimNetwork`, `SimClock`, `Nemesis`), history recording, Porcupine checker | Done (200 seeds) |
 | 3 | Durable storage: segmented CRC WAL, atomic hard state, crash recovery, group commit, crash/restart chaos | Done (500 seeds) |
-| 4 | Exactly-once client sessions + linearizable ReadIndex reads | Next |
-| 5 | Snapshots & InstallSnapshot | Planned |
+| 4 | Exactly-once client sessions + linearizable ReadIndex reads, linearizability checked on every seed | Done (500 seeds) |
+| 5 | Snapshots & InstallSnapshot | Next |
 | 6 | Membership changes (single-server, learners) | Planned |
 | 7 | Shard controller + sharded KV with live migration | Planned |
 | 8 | Real-TCP chaos, metrics dashboard, benchmarks | Planned |
@@ -27,6 +27,12 @@ Plan: [PHASES.md](PHASES.md) · Spec: [ARCHITECTURE.md](ARCHITECTURE.md) · Bugs
 - `RaftCore` is a deterministic state machine. Time is logical **ticks**. Every side effect is returned as an ordered `Output` (`PersistHardState`, `AppendToLog`, `TruncateLog`, `Send`, `ApplyEntries`), so the same code runs under the real driver and under the simulator.
 - Leader election with randomized timeouts and **PreVote**, so a partitioned node cannot inflate terms and depose a healthy leader.
 - Log replication with **fast backtracking** (`conflictIndex`/`conflictTerm`), a commit rule that only counts current-term entries (Raft Figure 8), and in-order apply.
+- A new leader commits a **no-op** from its own term, so it learns its commit index quickly.
+- **ReadIndex** linearizable reads without writing to the log: the leader records the commit index, proves it is still leader by collecting heartbeat acks for a fresh *read round* from a majority, waits until that index is applied, then serves the read. An isolated old leader never confirms a round, so it can never return stale data.
+
+### Exactly-once clients
+- Every request carries `(clientId, sequence)`. The replicated state machine keeps a **session table** (`lastSequence`, `lastReply`) per client. A retried write, even one committed twice through two different leaders, is applied once and answered from the cache.
+- Followers answer `WRONG_LEADER` with a leader hint; clients follow the hint or retry another node on timeout.
 
 ### Durable storage (`raft-storage`)
 - **WAL segments**: `[len][crc32][type][index][term][payload]` records, rolled at 64 MB.
@@ -40,8 +46,9 @@ Plan: [PHASES.md](PHASES.md) · Spec: [ARCHITECTURE.md](ARCHITECTURE.md) · Bugs
 - One single-threaded scheduler drives a 3-node cluster from a **seed**, so every run is exactly reproducible.
 - `SimNetwork`: drop, delay, duplicate, reorder, partition.
 - `SimDisk`: loses unsynced writes on crash and may keep a torn prefix of unsynced appends, just like a real disk.
-- `Nemesis`: random partitions and node crash/restart.
-- Every operation is recorded to `build/histories/<seed>.jsonl` and can be checked for **linearizability** with the Porcupine-based Go checker in `tools/porcupine-check`.
+- `Nemesis`: random partitions (often isolating the current leader), node crash/restart, and message-duplication storms. Three concurrent clients retry against the same and different leaders.
+- Every seed's history is checked for **linearizability** in-process (`LinearizabilityChecker`) and written to `build/histories/<seed>.jsonl` for the independent Porcupine-based Go checker in `tools/porcupine-check`.
+- **Negative control:** with ReadIndex switched off (`unsafeLocalReads`), the checker flags stale reads, so passing seeds actually mean something.
 - A failing seed prints `Reproduce: make chaos-one SEED=<n>`.
 
 ---
@@ -66,7 +73,8 @@ On Windows without `make`, use `gradlew.bat` with the same task names.
 raft-core/       RaftCore, Message, Output, LogEntry   (pure logic, no I/O)
 raft-storage/    FileStorage (WAL), HardStateFile, GroupCommitStorage
 raft-transport/  RaftNode driver, Transport, StorageOutputHandler
-sim/             SimCluster, SimNetwork, SimDisk, SimClock, Nemesis, ChaosTest, HistoryRecorder
+sim/             SimCluster, SimNode (KV server), Clerk, KvStateMachine, SimNetwork, SimDisk,
+                 Nemesis, ChaosTest, HistoryRecorder, LinearizabilityChecker
 kv/              original v1 server and client (being migrated onto raft-core)
 shardctrler/     Phase 7
 bench/           storage benchmark (system benchmarks in Phase 8)

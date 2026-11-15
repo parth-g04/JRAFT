@@ -46,3 +46,11 @@ Record each simulation-discovered bug and its regression test here.
   4. `PorcupineCheckerIntegrationTest` resolved `tools/porcupine-check` relative to `sim/` (Gradle's test working directory). It is skipped without Go, so it only failed in CI.
 - Fix: JUnit BOM + launcher in the root build; corrected the test to send a mismatching `prevLogIndex/prevLogTerm`; removed the duplicate; Gradle passes `jraft.repoRoot` to the sim tests; CI runs `go mod tidy && go test` for the checker; Gradle wrapper pinned so CI and local builds use the same version. Also dropped the strict JDK-21 toolchain (it failed on machines with only JDK 17/25) in favour of `options.release = 21`.
 - Regression test: `make test` in CI.
+
+## 2026-11-15 — Simulator could not detect stale reads (test-harness bug)
+
+- Symptom: none visible. That was the problem. Every seed passed regardless of how reads were served.
+- How found: designing the Phase 4 stale-leader test.
+- Root cause: the Phase 2/3 harness sent every GET through the Raft log, and the client took its answer from *any* replica's state machine (`SimCluster.result` scanned all nodes) instead of from the server it talked to. An old leader could never hand a stale value to a client, so the checker had nothing to catch.
+- Fix: a real client/server path (`ClientRequest`/`ClientReply` over a seeded, fault-injecting client channel that ignores partitions, so clients can reach an isolated old leader). Clients only see what the contacted server replies; every seed is checked by the in-process `LinearizabilityChecker`.
+- Regression test: negative controls that serve GETs from local state without ReadIndex and require the checker to fail: `ClientScenarioTest.withoutReadIndexTheSameScenarioReturnsStaleDataAndTheCheckerCatchesIt`, `ChaosSimulationTest.seed34WithoutReadIndexIsCaughtByTheChecker` (`Reproduce: make chaos-one SEED=34`), and `PorcupineCheckerIntegrationTest.porcupineAlsoFlagsTheStaleReadHistory` (CI).

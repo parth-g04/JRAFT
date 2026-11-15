@@ -19,6 +19,7 @@ public final class RaftNode {
     public void tick() { execute(core.tick()); }
     public void receive(int from, Message message) { execute(core.step(from, message)); }
     public void propose(byte[] command) { execute(core.propose(command)); }
+    public void readIndex(long readId) { execute(core.readIndex(readId)); }
 
     private void execute(Iterable<Output> outputs) {
         for (Output output : outputs) {
@@ -34,6 +35,10 @@ public final class RaftNode {
             } else if (output instanceof Output.Send send) {
                 outputHandler.flush();
                 transport.send(send.peerId(), send.message());
+            } else if (output instanceof Output.ReadReady ready) {
+                outputHandler.readReady(ready.readId(), ready.readIndex());
+            } else if (output instanceof Output.ReadFailed failed) {
+                outputHandler.readFailed(failed.readId());
             }
         }
     }

@@ -6,6 +6,7 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.TreeMap;
 
 /** Deterministic Raft protocol state. It owns no threads, I/O, or clock. */
 public final class RaftCore {
@@ -27,6 +28,17 @@ public final class RaftCore {
     private int heartbeatElapsed;
     private int leaderContactElapsed;
     private boolean preVoteRound;
+    /** Who this node believes is the leader of currentTerm (null if unknown). Used for client redirects. */
+    private Integer leaderId;
+
+    // ---- ReadIndex state (leader only; never persisted) ----
+    /** A read waiting for (1) a majority to ack readRound and (2) lastApplied >= readIndex. */
+    private record PendingRead(long readId, long readIndex, long readRound) { }
+    private final List<PendingRead> pendingReads = new ArrayList<>();
+    /** Highest readRound each peer has echoed back in the current term. */
+    private final Map<Integer, Long> ackedRound = new TreeMap<>();
+    /** Incremented for every read; stamped on every AppendRequest the leader sends afterwards. */
+    private long readRound;
 
     public RaftCore(int id, List<Integer> peers, int electionTimeoutTicks, int heartbeatTicks) {
         if (electionTimeoutTicks < 1 || heartbeatTicks < 1 || heartbeatTicks >= electionTimeoutTicks) {
@@ -57,7 +69,56 @@ public final class RaftCore {
         this.log.addAll(initialLog);
     }
 
-    public List<Output> tick() {
+    public List<Output> tick() { return finish(tickInternal()); }
+    public List<Output> propose(byte[] command) { return finish(proposeInternal(command)); }
+    public List<Output> step(int from, Message message) { return finish(stepInternal(from, message)); }
+
+    /**
+     * Starts a linearizable read (Raft thesis section 6.4, ReadIndex). The leader records a read index,
+     * confirms it is still leader by collecting heartbeat acks from a majority for a fresh round,
+     * and emits Output.ReadReady once the state machine has applied up to that index.
+     * Nothing is written to the log. Non-leaders answer Output.ReadFailed immediately.
+     */
+    public List<Output> readIndex(long readId) {
+        if (role != NodeRole.LEADER) return List.of(new Output.ReadFailed(readId));
+        // If this leader has not yet committed an entry of its own term, its commitIndex may lag
+        // behind entries committed by the previous leader. Its log contains every committed entry
+        // (leader completeness), so waiting for lastLogIndex (which includes the no-op) is safe.
+        long index = termAt(commitIndex) == currentTerm ? commitIndex : lastLogIndex();
+        readRound++;
+        pendingReads.add(new PendingRead(readId, index, readRound));
+        return finish(broadcastAppend());
+    }
+
+    private List<Output> finish(List<Output> outputs) {
+        if (pendingReads.isEmpty()) return outputs;
+        List<Output> all = new ArrayList<>(outputs);
+        all.addAll(resolveReads());
+        return List.copyOf(all);
+    }
+
+    private List<Output> resolveReads() {
+        List<Output> outputs = new ArrayList<>();
+        if (role != NodeRole.LEADER) {
+            // Leadership lost: we can no longer prove these reads are up to date.
+            for (PendingRead read : pendingReads) outputs.add(new Output.ReadFailed(read.readId()));
+            pendingReads.clear();
+            return outputs;
+        }
+        var iterator = pendingReads.iterator();
+        while (iterator.hasNext()) {
+            PendingRead read = iterator.next();
+            int confirmed = 1; // the leader itself
+            for (int peer : peers) if (ackedRound.getOrDefault(peer, 0L) >= read.readRound()) confirmed++;
+            if (hasMajority(confirmed) && lastApplied >= read.readIndex()) {
+                outputs.add(new Output.ReadReady(read.readId(), read.readIndex()));
+                iterator.remove();
+            }
+        }
+        return outputs;
+    }
+
+    private List<Output> tickInternal() {
         electionElapsed++;
         leaderContactElapsed++;
         if (role == NodeRole.LEADER) {
@@ -74,7 +135,7 @@ public final class RaftCore {
         return beginPreVote();
     }
 
-    public List<Output> propose(byte[] command) {
+    private List<Output> proposeInternal(byte[] command) {
         if (role != NodeRole.LEADER) return List.of();
         LogEntry entry = new LogEntry(lastLogIndex() + 1, currentTerm, command);
         log.add(entry);
@@ -86,7 +147,7 @@ public final class RaftCore {
         return List.copyOf(outputs);
     }
 
-    public List<Output> step(int from, Message message) {
+    private List<Output> stepInternal(int from, Message message) {
         if (!peers.contains(from)) return List.of();
         if (message instanceof Message.PreVoteRequest request) return onPreVoteRequest(from, request);
         if (message instanceof Message.PreVoteReply reply) return onPreVoteReply(from, reply);
@@ -135,6 +196,7 @@ public final class RaftCore {
         role = NodeRole.CANDIDATE;
         currentTerm++;
         votedFor = id;
+        leaderId = null;
         votes.clear();
         votes.add(id);
         electionElapsed = 0;
@@ -157,6 +219,7 @@ public final class RaftCore {
         if (termChanged) {
             currentTerm = request.term();
             votedFor = null;
+            leaderId = null;
             role = NodeRole.FOLLOWER;
             preVoteRound = false;
         }
@@ -181,21 +244,32 @@ public final class RaftCore {
 
     private List<Output> becomeLeader() {
         role = NodeRole.LEADER;
+        leaderId = id;
         heartbeatElapsed = 0;
         nextIndex.clear();
         matchIndex.clear();
+        ackedRound.clear();
         for (int peer : peers) {
             nextIndex.put(peer, lastLogIndex() + 1);
             matchIndex.put(peer, 0L);
         }
-        matchIndex.put(id, lastLogIndex());
-        return broadcastAppend();
+        // Raft section 8: commit a no-op from the new term right away. Until an entry of the current
+        // term commits, the leader cannot know which earlier entries are committed, so ReadIndex
+        // would have to wait for an unrelated client write.
+        LogEntry noOp = new LogEntry(lastLogIndex() + 1, currentTerm, new byte[0]);
+        log.add(noOp);
+        matchIndex.put(id, noOp.index());
+        List<Output> outputs = new ArrayList<>();
+        outputs.add(new Output.AppendToLog(List.of(noOp)));
+        outputs.addAll(broadcastAppend());
+        outputs.addAll(advanceCommit());
+        return List.copyOf(outputs);
     }
 
     private List<Output> onAppendRequest(int from, Message.AppendRequest request) {
         if (request.term() < currentTerm) {
             return List.of(new Output.Send(from, new Message.AppendReply(currentTerm, false,
-                    0, lastLogIndex() + 1, -1)));
+                    0, lastLogIndex() + 1, -1, request.readRound())));
         }
         List<Output> outputs = new ArrayList<>();
         boolean termChanged = request.term() > currentTerm;
@@ -203,6 +277,7 @@ public final class RaftCore {
             currentTerm = request.term();
             votedFor = null;
         }
+        leaderId = from;
         role = NodeRole.FOLLOWER;
         preVoteRound = false;
         electionElapsed = 0;
@@ -213,7 +288,7 @@ public final class RaftCore {
             long conflictIndex = localTerm < 0 ? lastLogIndex() + 1 : firstIndexOfTerm(localTerm);
             if (termChanged) outputs.add(persistHardState());
             outputs.add(new Output.Send(from, new Message.AppendReply(currentTerm, false, 0,
-                    conflictIndex, conflictTerm)));
+                    conflictIndex, conflictTerm, request.readRound())));
             return List.copyOf(outputs);
         }
 
@@ -244,13 +319,16 @@ public final class RaftCore {
         }
         if (termChanged) outputs.add(0, persistHardState());
         outputs.add(new Output.Send(from, new Message.AppendReply(currentTerm, true,
-                request.previousIndex() + request.entries().size(), 0, 0)));
+                request.previousIndex() + request.entries().size(), 0, 0, request.readRound())));
         return List.copyOf(outputs);
     }
 
     private List<Output> onAppendReply(int from, Message.AppendReply reply) {
         if (reply.term() > currentTerm) return stepDown(reply.term());
         if (role != NodeRole.LEADER || reply.term() != currentTerm) return List.of();
+        // Any reply in our term (success or log mismatch) proves the peer still accepted us as
+        // leader when it handled the request that carried reply.readRound().
+        ackedRound.merge(from, reply.readRound(), Math::max);
         if (reply.success()) {
             matchIndex.put(from, reply.matchIndex());
             nextIndex.put(from, reply.matchIndex() + 1);
@@ -303,12 +381,13 @@ public final class RaftCore {
         List<LogEntry> suffix = next <= lastLogIndex()
                 ? List.copyOf(log.subList((int) next - 1, log.size())) : List.of();
         return List.of(new Output.Send(peer, new Message.AppendRequest(currentTerm, id,
-                previous, termAt(previous), suffix, commitIndex)));
+                previous, termAt(previous), suffix, commitIndex, readRound)));
     }
 
     private List<Output> stepDown(long newTerm) {
         currentTerm = newTerm;
         votedFor = null;
+        leaderId = null;
         role = NodeRole.FOLLOWER;
         preVoteRound = false;
         return List.of(persistHardState());
@@ -328,6 +407,8 @@ public final class RaftCore {
     public NodeRole role() { return role; }
     public long currentTerm() { return currentTerm; }
     public Integer votedFor() { return votedFor; }
+    public Integer leaderId() { return leaderId; }
+    public int id() { return id; }
     public long commitIndex() { return commitIndex; }
     public long lastApplied() { return lastApplied; }
     public List<LogEntry> logEntries() { return List.copyOf(log); }

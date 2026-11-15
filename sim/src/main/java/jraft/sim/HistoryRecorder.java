@@ -5,10 +5,16 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
+import java.util.ArrayList;
+import java.util.List;
 
-/** Appends one JSON operation per line, with logical tick timestamps. */
+/**
+ * Records completed client operations. Each one is appended as a JSON line (the format read by
+ * tools/porcupine-check) and kept in memory for the in-process LinearizabilityChecker.
+ */
 public final class HistoryRecorder {
     private final Path path;
+    private final List<LinearizabilityChecker.Operation> operations = new ArrayList<>();
 
     public HistoryRecorder(Path path) {
         this.path = path;
@@ -21,18 +27,23 @@ public final class HistoryRecorder {
         }
     }
 
-    public synchronized void record(long clientId, KvCommand command, KvStateMachine.Result result,
-                                    long callTick, long returnTick) {
-        String output = result == null || result.value() == null ? "null" : quote(result.value());
-        String line = "{\"clientId\":" + clientId + ",\"op\":" + quote(command.operation().name().toLowerCase())
-                + ",\"key\":" + quote(command.key()) + ",\"value\":" + quote(command.value())
-                + ",\"output\":" + output + ",\"call\":" + callTick + ",\"return\":" + returnTick + "}\n";
+    /** {@code output} is the returned value for GET (null = key absent) and null for writes. */
+    public synchronized void record(long clientId, KvCommand command, String output, long call, long returned) {
+        String op = command.operation().name().toLowerCase();
+        String value = command.operation() == KvCommand.Operation.GET ? null : command.value();
+        operations.add(new LinearizabilityChecker.Operation(clientId, op, command.key(), value, output, call, returned));
+        String line = "{\"clientId\":" + clientId + ",\"op\":" + quote(op)
+                + ",\"key\":" + quote(command.key()) + ",\"value\":" + quote(value)
+                + ",\"output\":" + quote(output) + ",\"call\":" + call + ",\"return\":" + returned + "}\n";
         try {
             Files.writeString(path, line, StandardCharsets.UTF_8, StandardOpenOption.APPEND);
         } catch (IOException error) {
             throw new IllegalStateException("cannot append history " + path, error);
         }
     }
+
+    public synchronized List<LinearizabilityChecker.Operation> operations() { return List.copyOf(operations); }
+    public Path path() { return path; }
 
     private static String quote(String value) {
         if (value == null) return "null";

@@ -2,42 +2,64 @@ package jraft.sim;
 
 import jraft.raftcore.LogEntry;
 
-import java.util.HashMap;
 import java.util.Map;
 import java.util.TreeMap;
 
-/** Deterministic single-group key/value state machine used by the simulator. */
+/**
+ * Deterministic single-group key/value state machine with client sessions (exactly-once writes).
+ *
+ * Each client has at most one outstanding request and numbers them 1, 2, 3, ... A client may
+ * retry a request many times (to the same or a different leader), so the same command can be
+ * committed to the log more than once. The session table remembers the last sequence applied per
+ * client and its reply: a repeated sequence is not applied again and gets the cached reply.
+ *
+ * The session table is replicated state (it is rebuilt by replaying the log), so every replica
+ * makes the same duplicate decisions. TreeMaps keep iteration deterministic.
+ */
 public final class KvStateMachine {
-    public record RequestId(long clientId, long sequence) { }
     public record Result(String value, boolean found) { }
+    /** Last applied sequence for a client and the reply it produced. */
+    public record Session(long lastSequence, Result lastResult) { }
 
     private final Map<String, String> values = new TreeMap<>();
-    private final Map<RequestId, Result> results = new HashMap<>();
+    private final Map<Long, Session> sessions = new TreeMap<>();
 
     public void apply(LogEntry entry) {
+        if (entry.command().length == 0) return; // leader no-op
         KvCommand command = KvCommandCodec.decode(entry.command());
-        RequestId id = new RequestId(command.clientId(), command.sequence());
-        if (results.containsKey(id)) return;
-        Result result;
-        switch (command.operation()) {
-            case GET -> result = new Result(values.get(command.key()), values.containsKey(command.key()));
+        Session session = sessions.get(command.clientId());
+        if (session != null && command.sequence() <= session.lastSequence()) return; // duplicate
+        Result result = switch (command.operation()) {
+            case GET -> read(command.key()); // GETs normally use ReadIndex and are not logged
             case PUT -> {
                 values.put(command.key(), command.value());
-                result = new Result(null, true);
+                yield new Result(null, true);
             }
             case APPEND -> {
                 values.merge(command.key(), command.value(), String::concat);
-                result = new Result(null, true);
+                yield new Result(null, true);
             }
             case DELETE -> {
                 boolean found = values.containsKey(command.key());
-                result = new Result(values.remove(command.key()), found);
+                yield new Result(values.remove(command.key()), found);
             }
-            default -> throw new IllegalStateException("unhandled operation");
-        }
-        results.put(id, result);
+        };
+        sessions.put(command.clientId(), new Session(command.sequence(), result));
     }
 
-    public Result result(long clientId, long sequence) { return results.get(new RequestId(clientId, sequence)); }
+    /** Cached reply if {@code sequence} is the client's most recently applied request, else null. */
+    public Result cachedResult(long clientId, long sequence) {
+        Session session = sessions.get(clientId);
+        return session != null && session.lastSequence() == sequence ? session.lastResult() : null;
+    }
+
+    /** True when this or a later request of the client has already been applied. */
+    public boolean alreadyApplied(long clientId, long sequence) {
+        Session session = sessions.get(clientId);
+        return session != null && sequence <= session.lastSequence();
+    }
+
+    public Result read(String key) { return new Result(values.get(key), values.containsKey(key)); }
     public Map<String, String> snapshotView() { return Map.copyOf(values); }
+    public Map<Long, Session> sessionsView() { return Map.copyOf(sessions); }
 }
