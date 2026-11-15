@@ -93,3 +93,14 @@
 - Decision: `addServer` adds a non-voting learner. The leader replicates to it (entries or snapshot) but never counts it for quorums, and promotes it to voter with a second single-server change once its matchIndex reaches the commit index. Servers that are not voters (learners, new or removed servers) never start elections; any server accepts AppendEntries from a leader even if it is not yet in its own configuration.
 - Reason: adding an empty voter directly would immediately raise the quorum size while that server cannot acknowledge anything, which can stall commits (thesis section 4.2.1).
 - Consequence: an add is two log entries (learner, then promotion). Admin API: `addServer(id)` / `removeServer(id)` returning ACCEPTED, NOT_LEADER, IN_PROGRESS, NO_CHANGE or INVALID (removing the last voter).
+
+## Sharding: controller group, per-shard status machine, pull-based migration
+
+- Date: 2026-11-15
+- Status: accepted for Phase 7
+- Decision: a Raft-replicated **shard controller** keeps numbered configurations (16 shards -> group, groups -> servers). Join/Leave/Move are logged with client sessions; Query is a ReadIndex read. Rebalancing gives the ceil(16/g) targets to the groups that already own the most shards and moves only shards forced out (minimal, deterministic).
+- Decision: each **shard group** puts every step of a reconfiguration in its own Raft log: `Reconfigure(next)` (only the next number, only when every shard is SERVING), `InsertShards`, `DeleteShards`, `GcDone`. Shard status: SERVING, PULLING (ours, waiting for data), BEPULLING (frozen copy kept for the new owner), GCING (we have it; old owner must delete). Client operations and ReadIndex reads succeed only on SERVING/GCING shards, otherwise WRONG_GROUP.
+- Decision: migration is **pull-based**: the new owner's leader asks the previous owner for the frozen data and the per-shard session table, retrying until it gets it; then it asks the old owner to delete its copy and records GcDone. Requests are stateless and simply repeated; every log command is idempotent.
+- Reason: a group can only lose a shard by committing a configuration entry; after that entry the shard is frozen, so the data the new owner pulls includes every write the old owner ever accepted, and no write is accepted twice (sessions move with the shard). Serving only one configuration step at a time keeps the state per shard small and explainable. Unaffected shards keep serving throughout.
+- Consequence: a group waits for all its migrations (in and out) before applying the next configuration, so a slow peer group delays reconfiguration of its neighbours but never correctness.
+- Simulator: `GroupNode` is a generic Raft host (RaftCore + SimDisk + a service: controller or shard group); `ShardedWorld` runs a controller and three shard groups (12 nodes) on one deterministic network. The single-group `SimCluster` from Phases 2-6 is kept unchanged for its tests.

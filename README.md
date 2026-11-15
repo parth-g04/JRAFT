@@ -1,6 +1,6 @@
 # J-Raft: Distributed Key-Value Store
 
-A distributed key-value store built from scratch in Java on the **Raft** consensus algorithm, currently being upgraded to **J-Raft v2**: a deterministic Raft core, a seed-reproducible fault-injection simulator, a durable write-ahead log, exactly-once clients and linearizable reads checked on every simulated run, snapshots with InstallSnapshot, live membership changes, and (next) sharding.
+A distributed key-value store built from scratch in Java on the **Raft** consensus algorithm, currently being upgraded to **J-Raft v2**: a deterministic Raft core, a seed-reproducible fault-injection simulator, a durable write-ahead log, exactly-once clients and linearizable reads checked on every simulated run, snapshots with InstallSnapshot, live membership changes, and a sharded store with live shard migration.
 
 Plan: [PHASES.md](PHASES.md) · Spec: [ARCHITECTURE.md](ARCHITECTURE.md) · Bugs found by simulation: [docs/BUGS.md](docs/BUGS.md) · Results: [docs/RESULTS.md](docs/RESULTS.md) · Decisions: [docs/DECISIONS.md](docs/DECISIONS.md)
 
@@ -17,8 +17,8 @@ Plan: [PHASES.md](PHASES.md) · Spec: [ARCHITECTURE.md](ARCHITECTURE.md) · Bugs
 | 4 | Exactly-once client sessions + linearizable ReadIndex reads, linearizability checked on every seed | Done (500 seeds) |
 | 5 | Snapshots, WAL compaction, chunked InstallSnapshot | Done (500 seeds) |
 | 6 | Membership changes: single-server, learners, leader removal | Done (500 seeds) |
-| 7 | Shard controller + sharded KV with live migration | Next |
-| 8 | Real-TCP chaos, metrics dashboard, benchmarks | Planned |
+| 7 | Shard controller + sharded KV with live migration | Done (500 seeds) |
+| 8 | Real-TCP chaos, metrics dashboard, benchmarks | Next |
 | 9 | Polish | Planned |
 
 ## What is implemented today
@@ -57,6 +57,12 @@ Plan: [PHASES.md](PHASES.md) · Spec: [ARCHITECTURE.md](ARCHITECTURE.md) · Bugs
 - **Negative control:** with ReadIndex switched off (`unsafeLocalReads`), the checker flags stale reads, so passing seeds actually mean something.
 - A failing seed prints `Reproduce: make chaos-one SEED=<n>`.
 
+### Sharded store (`shardctrler`, `kv`)
+- **Shard controller:** its own Raft group storing numbered configurations (16 shards → replica group). `Join`/`Leave`/`Move` are logged with client sessions; `Query` is a ReadIndex read. Rebalancing is deterministic and moves the minimum number of shards (checked against brute force).
+- **Shard groups:** each a Raft group. Configuration changes and every migration step (`Reconfigure`, `InsertShards`, `DeleteShards`, `GcDone`) are log entries, so all replicas switch at the same log position, one configuration at a time.
+- **Live migration:** a shard that leaves is frozen; the new owner **pulls** its data and its client-session table, then tells the old owner to garbage-collect it. Shards that are not moving keep serving. Requests for shards a group does not serve get `WRONG_GROUP`, and the clerk refreshes its configuration and retries with the same `(clientId, seq)`.
+- Simulated with a controller and three shard groups (12 Raft nodes): joins, leaves and moves under partitions, crashes and duplication; every history is checked for linearizability over all keys.
+
 ---
 
 ## Build and test
@@ -67,6 +73,8 @@ Requires **JDK 21 or newer**. The Gradle wrapper is included, so no Gradle insta
 make test             # unit tests + 50-seed quick chaos     (or: ./gradlew test)
 make chaos SEEDS=500  # long simulation                     (or: ./gradlew :sim:chaos -Pseed=1 -Pseeds=500)
 make chaos-one SEED=81
+make shard-chaos SEEDS=300   # sharded store: controller + 3 groups, joins/leaves under faults
+make shard-chaos-one SEED=4
 make bench            # group-commit window benchmark → CSV
 ./gradlew :bench:recoveryBenchmark   # recovery time, 1M entries, with/without snapshot
 make check-history FILE=build/histories/123.jsonl   # Porcupine: OK / ILLEGAL (+ HTML visualization)
@@ -81,9 +89,10 @@ raft-core/       RaftCore, Message, Output, LogEntry   (pure logic, no I/O)
 raft-storage/    FileStorage (WAL), HardStateFile, GroupCommitStorage
 raft-transport/  RaftNode driver, Transport, StorageOutputHandler
 sim/             SimCluster, SimNode (KV server), Clerk, KvStateMachine, SimNetwork, SimDisk,
+                 ShardedWorld, GroupNode, ShardedClerk, ShardedNemesis, ShardedChaosTest,
                  Nemesis, ChaosTest, HistoryRecorder, LinearizabilityChecker
-kv/              original v1 server and client (being migrated onto raft-core)
-shardctrler/     Phase 7
+kv/              ShardKvStateMachine, ShardKvServer (migration logic); v1 server in the default package
+shardctrler/     ShardConfig, Rebalancer, ControllerStateMachine
 bench/           storage benchmark (system benchmarks in Phase 8)
 tools/porcupine-check/   Go linearizability checker
 ```

@@ -50,6 +50,12 @@ public final class SimNetwork {
 
     public void heal() { partitionSide.clear(); }
 
+    /** True when two live nodes are on the same side of the current partition. */
+    public boolean connected(int from, int to) {
+        if (crashed.contains(from) || crashed.contains(to)) return false;
+        return partitionSide.getOrDefault(from, 0).equals(partitionSide.getOrDefault(to, 0));
+    }
+
     public void crash(int nodeId) { crashed.add(nodeId); }
     public void restart(int nodeId) { crashed.remove(nodeId); }
 

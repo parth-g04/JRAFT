@@ -27,5 +27,6 @@ subprojects {
 
 tasks.named<Test>("test") {
     dependsOn(":sim:quickChaos")
+    dependsOn(":sim:quickShardChaos")
     dependsOn(subprojects.map { "${it.path}:test" })
 }

@@ -80,3 +80,14 @@ Reading: recovery time follows the number of replayed entries; with a snapshot i
 - Scripted: grow 3 to 5 voters and remove two original servers (the leader first) under client load, still linearizable; a removed leader hands over and the group keeps committing; a learner that is 200 entries behind catches up by InstallSnapshot before promotion.
 - Performance: fixing the AppendEntries ping-pong (BUGS.md) cut the 500-seed run from 3 min 27 s (Phase 5, 3 nodes) to 50 s (5 nodes, membership changes).
 - Reproduce: `make chaos SEEDS=500`; `make chaos-one SEED=<n>`.
+
+## Phase 7: shard controller and sharded KV with live migration
+
+- Date: 2026-11-15
+- World: shard controller (3 nodes) + groups 100, 101, 102 (3 nodes each), 16 shards, 3 clients x 40 operations on 10 keys spread over 10 shards, snapshots every 16 entries (256-byte chunks). The admin starts with Join(100); the nemesis adds Join/Leave/Move (always keeping one group) while it partitions (often a group or controller leader), crashes/restarts nodes with torn-tail disks, and runs duplication storms. Server-to-server messages obey partitions; clients can reach every server.
+- Checks per seed: all client and admin operations complete after healing; every group reaches the controller's latest configuration with no migration in progress; the 3 replicas of each group have byte-identical state; every shard is SERVING at exactly its owner in the latest configuration and held by no other group; the whole history (all keys) is linearizable.
+- Result: all 500 seeds passed (the spec asks for 300): `Sharded chaos passed for 500 seed(s); reconfiguration requests 2225, configurations reached 2725, shard migrations 7005, snapshot installs 205`, in 36 s. Reproduce: `make shard-chaos SEEDS=500`, `make shard-chaos-one SEED=<n>`.
+- Negative control: groups that answer GETs from any local copy (no ownership check, no ReadIndex) fail the linearizability check on 33 of seeds 1-100 (first: seed 4, kept as a regression test). With the real code: 0 of 500.
+- Unit tests: rebalance is balanced (2,000 random cases, more groups than shards included), deterministic and independent of group order, and moves exactly as many shards as a brute-force search over all balanced assignments finds necessary; duplicated Join creates one configuration; controller snapshot round trip; full migration lifecycle on two group state machines (freeze, pull with sessions, duplicate retry at the new owner, GC); only the next configuration and only when stable; snapshot mid-migration.
+- Scenario: join 100, 101, 102 then remove 100 under client load: all 180 operations linearizable, every shard ends at its owner.
+- Bugs found by the sharded simulation: none so far.

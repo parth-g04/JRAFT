@@ -33,13 +33,24 @@ class PorcupineCheckerIntegrationTest {
         assertThat(run.exitCode()).isEqualTo(1);
     }
 
+    @Test
+    void shardedHistoryWithMigrationsIsLinearizable() throws Exception {
+        assumeTrue(goAvailable(), "Go 1.22 is not installed; skipping Porcupine history check");
+        ShardedChaosTest.runSeed(1);
+        CheckerRun run = runChecker("sharded-1");
+        assertThat(run.exitCode()).as(run.output()).isZero();
+        assertThat(run.output()).contains("OK");
+    }
+
     private record CheckerRun(int exitCode, String output) { }
 
-    private static CheckerRun runChecker(long seed) throws Exception {
+    private static CheckerRun runChecker(long seed) throws Exception { return runChecker(String.valueOf(seed)); }
+
+    private static CheckerRun runChecker(String historyName) throws Exception {
         // Gradle runs tests from sim/, so resolve the checker from the repository root.
         Path repoRoot = Path.of(System.getProperty("jraft.repoRoot", "..")).toAbsolutePath();
         Path checkerDirectory = repoRoot.resolve("tools").resolve("porcupine-check");
-        Path history = Path.of("build", "histories", seed + ".jsonl").toAbsolutePath();
+        Path history = Path.of("build", "histories", historyName + ".jsonl").toAbsolutePath();
         Process process = new ProcessBuilder("go", "run", ".", history.toString())
                 .directory(checkerDirectory.toFile()).redirectErrorStream(true).start();
         boolean finished = process.waitFor(120, TimeUnit.SECONDS);

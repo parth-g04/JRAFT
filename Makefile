@@ -1,4 +1,4 @@
-.PHONY: build test chaos chaos-one bench check-history
+.PHONY: build test chaos chaos-one shard-chaos shard-chaos-one bench check-history
 
 GRADLE ?= ./gradlew
 
@@ -13,6 +13,12 @@ chaos:
 
 chaos-one:
 	$(GRADLE) :sim:chaos -Pseed=$(SEED) -Pseeds=1
+
+shard-chaos:
+	$(GRADLE) :sim:shardChaos -Pseed=1 -Pseeds=$(or $(SEEDS),300)
+
+shard-chaos-one:
+	$(GRADLE) :sim:shardChaos -Pseed=$(SEED) -Pseeds=1
 
 bench:
 	$(GRADLE) :bench:storageBenchmark
